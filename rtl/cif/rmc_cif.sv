@@ -33,7 +33,10 @@ module rmc_cif #(
   localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS) : 1,
   localparam int SLOT_W    = (($clog2(N_WDB) > $clog2(N_RDB)) ?
                               $clog2(N_WDB) : $clog2(N_RDB)),
-  localparam int DADDR_W   = RANK_W + BG_W + BANK_PER_BG_W + ROW_W + COL_W
+  localparam int DADDR_W   = RANK_W + BG_W + BANK_PER_BG_W + ROW_W + COL_W,
+  // dft_obs width, from the same function the DFT module checks against
+  localparam int DFT_OBS_W = rmc_cif_dft_pkg::dft_obs_w(AXI_IDW, AXI_AW, ROB_DEPTH,
+                                                         MAX_PKTS, N_WDB, N_RDB)
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
@@ -101,7 +104,10 @@ module rmc_cif #(
   // RD_SRAM client-side read port (MC writes; CIF drains to R)
   output logic                     rdb_re,
   output logic [$clog2(N_RDB)-1:0] rdb_addr,
-  input  logic [SRAM_W-1:0]        rdb_dout
+  input  logic [SRAM_W-1:0]        rdb_dout,
+
+  // DFT observation bus (passive, output only). Field order: rmc_cif_dft.sv.
+  output logic [DFT_OBS_W-1:0]     dft_obs
 );
 
   // nets between sub-blocks (TODO: size/name as logic fills in)
@@ -147,17 +153,128 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // segmentation: read + write burst splitters, one per direction. Stubs - wiring
-  // TODO (ROB handoff, pre-ROB buffer, addr_map, per-channel req FIFOs).
+  // guarded widths for DFT / slot nets (a parameter of 1 never gives a 0-bit bus)
+  localparam int RDB_AW_G  = (N_RDB > 1) ? $clog2(N_RDB) : 1;
+  localparam int WDB_AW_G  = (N_WDB > 1) ? $clog2(N_WDB) : 1;
+  localparam int CNT_W     = (MAX_PKTS > 1) ? $clog2(MAX_PKTS+1) : 1;
+  localparam int OCC_W     = $clog2(ROB_DEPTH + 1);
+
+  // Read segmenter nets. "undriven" = ROB<->seg handoff still TODO upstream (floats as
+  // the unconnected pins did); T10 forces them.
+  logic                          r_seg_req_valid;          // undriven
+  logic [AXI_AW-1:0]             r_seg_req_addr;           // undriven
+  logic [7:0]                    r_seg_req_len;            // undriven
+  logic [2:0]                    r_seg_req_size;           // undriven
+  logic [RDB_AW_G-1:0]           r_seg_slot_base;          // undriven
+  logic                          r_seg_rob_ready;          // undriven
+  logic [N_CH-1:0]               r_pkt_ready;              // undriven
+  // rseg outputs: observation only, not yet consumed by the ROB or request path
+  logic                          r_seg_last;
+  logic [CNT_W-1:0]              r_seg_npkts;
+  logic [PKT_OFF_W-1:0]          r_seg_offset;
+  logic [7:0]                    r_seg_len;
+  logic [2:0]                    r_seg_size;
+  logic [RDB_AW_G-1:0]           r_seg_head;
+  logic [N_CH-1:0]               r_pkt_valid;
+  logic [N_CH-1:0][ROB_IDX_W-1:0] r_pkt_rob_index;
+  logic [N_CH-1:0][DADDR_W-1:0]  r_pkt_daddr;
+  logic [N_CH-1:0][PKT_NUM_W-1:0] r_pkt_num;
+  logic [N_CH-1:0]               r_pkt_last;
+  logic [N_CH-1:0][RDB_AW_G-1:0] r_pkt_slot;
+  logic [N_CH-1:0][PKT_OFF_W-1:0] r_pkt_offset;
+  logic [N_CH-1:0]               r_pkt_narrow;
+  logic                          r_seg_busy;           // dft: request being split
+  logic [CNT_W-1:0]              r_seg_pkt_cnt;        // dft: packets issued so far
+
+  // Write segmenter nets (wseg is a stub: its outputs are tied 0)
+  logic [N_CH-1:0]               w_pkt_ready;              // undriven
+  logic                          w_seg_last;
+  logic [CNT_W-1:0]              w_seg_npkts;
+  logic [WDB_AW_G-1:0]           w_seg_head;
+  logic                          w_free_slot_take;
+  logic [N_CH-1:0]               w_pkt_valid;
+  logic [N_CH-1:0][ROB_IDX_W-1:0] w_pkt_rob_index;
+  logic [N_CH-1:0][DADDR_W-1:0]  w_pkt_daddr;
+  logic [N_CH-1:0][PKT_NUM_W-1:0] w_pkt_num;
+  logic [N_CH-1:0]               w_pkt_last;
+  logic [N_CH-1:0][WDB_AW_G-1:0] w_pkt_slot;
+  logic [N_CH-1:0][PKT_OFF_W-1:0] w_pkt_offset;
+  logic [N_CH-1:0]               w_pkt_narrow;
+
+  // ROB outputs and DFT taps; r_* = read ROB, w_* = write ROB (kept separate)
+  logic [ROB_IDX_W-1:0]          r_rob_idx, w_rob_idx;
+  logic                          r_resp_valid, w_resp_valid;
+  logic [AXI_IDW-1:0]            r_resp_id, w_resp_id;
+  logic [1:0]                    r_resp_resp, w_resp_resp;
+  logic [RDB_AW_G-1:0]           r_resp_head;
+  logic [PKT_OFF_W-1:0]          r_resp_offset;
+  logic [7:0]                    r_resp_len;
+  logic [2:0]                    r_resp_size;
+  logic [WDB_AW_G-1:0]           w_resp_head;
+  // dft_* come from output-only taps inside rrob/wrob; per-slot buses are slot-major
+  logic [ROB_IDX_W-1:0]          r_dft_alloc_ptr, w_dft_alloc_ptr;
+  logic [ROB_IDX_W-1:0]          r_dft_retire_ptr, w_dft_retire_ptr;
+  logic [OCC_W-1:0]              r_dft_occ, w_dft_occ;
+  logic                          r_dft_admit_fire, w_dft_admit_fire;
+  logic                          r_dft_retire_fire, w_dft_retire_fire;
+  logic                          r_dft_pending_split, w_dft_pending_split;
+  logic [ROB_DEPTH-1:0]          r_dft_inflow_complt, w_dft_inflow_complt;
+  logic [ROB_DEPTH-1:0]          r_dft_ent_err, w_dft_ent_err;
+  logic [ROB_DEPTH-1:0]          r_dft_ent_derr, w_dft_ent_derr;
+  logic [ROB_DEPTH*CNT_W-1:0]    r_dft_outflow_cnt, w_dft_outflow_cnt;
+  logic [ROB_DEPTH*CNT_W-1:0]    r_dft_n_pkts, w_dft_n_pkts;
+  logic [ROB_DEPTH*RDB_AW_G-1:0] r_dft_slot_head;
+  logic [ROB_DEPTH*WDB_AW_G-1:0] w_dft_slot_head;
+
+  // segmentation: read + write burst splitters, one per direction. Handoff to the
+  // ROBs / request FIFOs is TODO; outputs go to observation nets only.
   rmc_cif_rseg #(
-    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
+    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW), .N_SLOTS (N_RDB)
   ) u_rseg (
-    .aclk (aclk), .aresetn (aresetn)
+    .aclk (aclk), .aresetn (aresetn),
+    .req_in_valid     (r_seg_req_valid),
+    .req_in_addr      (r_seg_req_addr),
+    .req_in_len       (r_seg_req_len),
+    .req_in_size      (r_seg_req_size),
+    .req_in_slot_base (r_seg_slot_base),
+    .addr_map         (addr_map),
+    .ROB_IDX          (r_rob_idx),
+    .ROB_READY        (r_seg_rob_ready),
+    .SEG_LAST         (r_seg_last),
+    .SEG_NPKTS        (r_seg_npkts),
+    .SEG_OFFSET       (r_seg_offset),
+    .SEG_LEN          (r_seg_len),
+    .SEG_SIZE         (r_seg_size),
+    .SEG_HEAD_PTR     (r_seg_head),
+    .packet_valid     (r_pkt_valid),
+    .packet_ready     (r_pkt_ready),
+    .packet_rob_index (r_pkt_rob_index),
+    .packet_daddr     (r_pkt_daddr),
+    .packet_pkt_num   (r_pkt_num),
+    .packet_last_in_txn (r_pkt_last),
+    .packet_slot      (r_pkt_slot),
+    .packet_offset    (r_pkt_offset),
+    .packet_narrow    (r_pkt_narrow),
+    .dft_busy         (r_seg_busy),
+    .dft_pkt_cnt      (r_seg_pkt_cnt)
   );
   rmc_cif_wseg #(
-    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
+    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW), .N_SLOTS (N_WDB)
   ) u_wseg (
-    .aclk (aclk), .aresetn (aresetn)
+    .aclk (aclk), .aresetn (aresetn),
+    .SEG_LAST         (w_seg_last),
+    .SEG_NPKTS        (w_seg_npkts),
+    .SEG_HEAD_PTR     (w_seg_head),
+    .free_slot_take   (w_free_slot_take),
+    .packet_valid     (w_pkt_valid),
+    .packet_ready     (w_pkt_ready),
+    .packet_rob_index (w_pkt_rob_index),
+    .packet_daddr     (w_pkt_daddr),
+    .packet_pkt_num   (w_pkt_num),
+    .packet_last_in_txn (w_pkt_last),
+    .packet_slot      (w_pkt_slot),
+    .packet_offset    (w_pkt_offset),
+    .packet_narrow    (w_pkt_narrow)
   );
 
   // completion never back-pressures: tie ready high. A completion only bumps a
@@ -174,10 +291,12 @@ module rmc_cif #(
   // built yet - for now admit is wired straight from the validator + AXI channel.
 
   // read ROB. admit direct from AR channel + validator (AR_req buffer not built yet).
+  // SEG_*, RESP_READY and cmpl_err are left unconnected (TODO); RESP_* only feed DFT.
   rmc_cif_rrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
-    .AXI_IDW   (AXI_IDW)
+    .AXI_IDW   (AXI_IDW),
+    .N_SLOTS   (N_RDB)
   ) u_rrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
@@ -185,15 +304,36 @@ module rmc_cif #(
     .cmpl_rob_index (async_mc_cmpl_rob_index),
     .AW_REQUEST     ({arid, arlen, arsize, ar_ok}),
     .A_ID_VALID     (arvalid),
-    .A_ID_READY     (arready)
-    // TODO: SEG_* from u_rseg; RESP_* -> R response path
+    .A_ID_READY     (arready),
+    // TODO: SEG_* from u_rseg; RESP_READY / R response path
+    .ROB_IDX        (r_rob_idx),
+    .RESP_VALID     (r_resp_valid),
+    .RESP_ID        (r_resp_id),
+    .RESP_RESP      (r_resp_resp),
+    .RESP_HEAD_PTR  (r_resp_head),
+    .RESP_OFFSET    (r_resp_offset),
+    .RESP_LEN       (r_resp_len),
+    .RESP_SIZE      (r_resp_size),
+    .dft_alloc_ptr     (r_dft_alloc_ptr),
+    .dft_retire_ptr    (r_dft_retire_ptr),
+    .dft_occ           (r_dft_occ),
+    .dft_admit_fire    (r_dft_admit_fire),
+    .dft_retire_fire   (r_dft_retire_fire),
+    .dft_pending_split (r_dft_pending_split),
+    .dft_inflow_complt (r_dft_inflow_complt),
+    .dft_ent_err       (r_dft_ent_err),
+    .dft_ent_derr      (r_dft_ent_derr),
+    .dft_outflow_cnt   (r_dft_outflow_cnt),
+    .dft_n_pkts        (r_dft_n_pkts),
+    .dft_slot_head     (r_dft_slot_head)
   );
 
   // write ROB. admit direct from AW channel + validator (AW_req buffer not built yet).
   rmc_cif_wrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
-    .AXI_IDW   (AXI_IDW)
+    .AXI_IDW   (AXI_IDW),
+    .N_SLOTS   (N_WDB)
   ) u_wrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
@@ -201,8 +341,25 @@ module rmc_cif #(
     .cmpl_rob_index (async_mc_cmpl_rob_index),
     .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
     .A_ID_VALID     (awvalid),
-    .A_ID_READY     (awready)
-    // TODO: SEG_* from u_wseg; RESP_* -> B response path
+    .A_ID_READY     (awready),
+    // TODO: SEG_* from u_wseg; RESP_READY / B response path
+    .ROB_IDX        (w_rob_idx),
+    .RESP_VALID     (w_resp_valid),
+    .RESP_ID        (w_resp_id),
+    .RESP_RESP      (w_resp_resp),
+    .RESP_HEAD_PTR  (w_resp_head),
+    .dft_alloc_ptr     (w_dft_alloc_ptr),
+    .dft_retire_ptr    (w_dft_retire_ptr),
+    .dft_occ           (w_dft_occ),
+    .dft_admit_fire    (w_dft_admit_fire),
+    .dft_retire_fire   (w_dft_retire_fire),
+    .dft_pending_split (w_dft_pending_split),
+    .dft_inflow_complt (w_dft_inflow_complt),
+    .dft_ent_err       (w_dft_ent_err),
+    .dft_ent_derr      (w_dft_ent_derr),
+    .dft_outflow_cnt   (w_dft_outflow_cnt),
+    .dft_n_pkts        (w_dft_n_pkts),
+    .dft_slot_head     (w_dft_slot_head)
   );
 
   // request builder / response stubs (TODO)
@@ -230,5 +387,70 @@ module rmc_cif #(
   assign wdb_din  = '0;
   assign rdb_re   = 1'b0;
   assign rdb_addr = '0;
+
+  // DFT observation (passive; wiring only)
+  rmc_cif_dft #(
+    .AXI_IDW (AXI_IDW), .AXI_AW (AXI_AW), .ROB_DEPTH (ROB_DEPTH),
+    .MAX_PKTS (MAX_PKTS), .N_WDB (N_WDB), .N_RDB (N_RDB)
+  ) u_dft (
+    .awvalid (awvalid), .awready (awready), .awaddr (awaddr),
+    .awlen (awlen), .awsize (awsize), .awid (awid),
+    .arvalid (arvalid), .arready (arready), .araddr (araddr),
+    .arlen (arlen), .arsize (arsize), .arid (arid),
+    .wvalid (wvalid), .wready (wready), .wstrb (wstrb), .wlast (wlast),
+    .bvalid (bvalid), .bready (bready), .rvalid (rvalid), .rready (rready),
+    .aw_daddr (aw_daddr), .ar_daddr (ar_daddr),
+    .aw_ch (aw_ch), .ar_ch (ar_ch), .aw_off (aw_off), .ar_off (ar_off),
+    .addr_map (addr_map),
+    .aw_ok (aw_ok), .ar_ok (ar_ok),
+    // read ROB
+    .rd_rob_index (r_rob_idx), .rd_idx_vld (r_dft_pending_split),
+    .rd_alloc_vld (r_dft_admit_fire),
+    .rd_head (r_dft_retire_ptr), .rd_tail (r_dft_alloc_ptr), .rd_occ (r_dft_occ),
+    .rd_retire_vld (r_resp_valid), .rd_retire_fire (r_dft_retire_fire),
+    .rd_inflow_complt (r_dft_inflow_complt), .rd_outflow_cnt (r_dft_outflow_cnt),
+    .rd_n_pkts (r_dft_n_pkts), .rd_ent_err (r_dft_ent_err), .rd_ent_derr (r_dft_ent_derr),
+    .rd_slot_head (r_dft_slot_head),
+    .rd_resp_id (r_resp_id), .rd_resp_resp (r_resp_resp), .rd_resp_head (r_resp_head),
+    .rd_resp_offset (r_resp_offset), .rd_resp_len (r_resp_len), .rd_resp_size (r_resp_size),
+    // write ROB
+    .wr_rob_index (w_rob_idx), .wr_idx_vld (w_dft_pending_split),
+    .wr_alloc_vld (w_dft_admit_fire),
+    .wr_head (w_dft_retire_ptr), .wr_tail (w_dft_alloc_ptr), .wr_occ (w_dft_occ),
+    .wr_retire_vld (w_resp_valid), .wr_retire_fire (w_dft_retire_fire),
+    .wr_inflow_complt (w_dft_inflow_complt), .wr_outflow_cnt (w_dft_outflow_cnt),
+    .wr_n_pkts (w_dft_n_pkts), .wr_ent_err (w_dft_ent_err), .wr_ent_derr (w_dft_ent_derr),
+    .wr_slot_head (w_dft_slot_head),
+    .wr_resp_id (w_resp_id), .wr_resp_resp (w_resp_resp), .wr_resp_head (w_resp_head),
+    // read segmenter (implemented)
+    .rs_busy (r_seg_busy), .rs_pkt_cnt (r_seg_pkt_cnt),
+    .rs_seg_last (r_seg_last), .rs_seg_npkts (r_seg_npkts),
+    .rs_seg_offset (r_seg_offset), .rs_seg_len (r_seg_len), .rs_seg_size (r_seg_size),
+    .rs_seg_head (r_seg_head),
+    .rs_pkt_valid (r_pkt_valid), .rs_pkt_ready (r_pkt_ready),
+    .rs_pkt_rob_index (r_pkt_rob_index), .rs_pkt_daddr (r_pkt_daddr),
+    .rs_pkt_num (r_pkt_num), .rs_pkt_last (r_pkt_last), .rs_pkt_slot (r_pkt_slot),
+    .rs_pkt_offset (r_pkt_offset), .rs_pkt_narrow (r_pkt_narrow),
+    // write segmenter (stub, tied 0)
+    .ws_seg_last (w_seg_last), .ws_seg_npkts (w_seg_npkts), .ws_seg_head (w_seg_head),
+    .ws_free_slot_take (w_free_slot_take),
+    .ws_pkt_valid (w_pkt_valid), .ws_pkt_ready (w_pkt_ready),
+    .ws_pkt_rob_index (w_pkt_rob_index), .ws_pkt_daddr (w_pkt_daddr),
+    .ws_pkt_num (w_pkt_num), .ws_pkt_last (w_pkt_last), .ws_pkt_slot (w_pkt_slot),
+    .ws_pkt_offset (w_pkt_offset), .ws_pkt_narrow (w_pkt_narrow),
+    // async FIFO boundary
+    .async_mc_req_valid (async_mc_req_valid), .async_mc_req_ready (async_mc_req_ready),
+    .async_mc_req_rob_index (async_mc_req_rob_index), .async_mc_req_op (async_mc_req_op),
+    .async_mc_req_daddr (async_mc_req_daddr), .async_mc_req_pkt_num (async_mc_req_pkt_num),
+    .async_mc_req_last_in_txn (async_mc_req_last_in_txn),
+    .async_mc_req_sram_slot (async_mc_req_sram_slot),
+    .async_mc_cmpl_valid (async_mc_cmpl_valid), .async_mc_cmpl_ready (async_mc_cmpl_ready),
+    .async_mc_cmpl_rob_index (async_mc_cmpl_rob_index),
+    // data SRAM
+    .wdb_we (wdb_we), .wdb_addr (wdb_addr), .wdb_din (wdb_din),
+    .rdb_re (rdb_re), .rdb_addr (rdb_addr), .rdb_dout (rdb_dout),
+    .aclk (aclk), .aresetn (aresetn),
+    .dft_obs (dft_obs)
+  );
 
 endmodule : rmc_cif

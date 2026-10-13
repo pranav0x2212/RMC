@@ -64,10 +64,25 @@ module rmc_cif_rrob #(
   output logic [SLOT_PTR_W-1:0]  RESP_HEAD_PTR,    // RD-SRAM head slot
   output logic [PKT_OFF_W-1:0]   RESP_OFFSET,      // start byte offset (pre/post trim)
   output logic [7:0]             RESP_LEN,         // ar_len
-  output logic [2:0]             RESP_SIZE         // ar_size
+  output logic [2:0]             RESP_SIZE,        // ar_size
+
+  // DFT taps (passive, output only; no effect on ROB state). Per-slot buses are
+  // slot-major: slot i occupies bits [i*W +: W].
+  output logic [PTR_W-1:0]                  dft_alloc_ptr,    // slot being filled/split
+  output logic [PTR_W-1:0]                  dft_retire_ptr,   // oldest slot
+  output logic [$clog2(ROB_DEPTH+1)-1:0]    dft_occ,          // entries in flight
+  output logic                              dft_admit_fire,
+  output logic                              dft_retire_fire,
+  output logic                              dft_pending_split, // slot handed to segmenter
+  output logic [ROB_DEPTH-1:0]              dft_inflow_complt,
+  output logic [ROB_DEPTH-1:0]              dft_ent_err,      // validation-fail flag per slot
+  output logic [ROB_DEPTH-1:0]              dft_ent_derr,     // downstream-error flag per slot
+  output logic [ROB_DEPTH*CNT_W-1:0]        dft_outflow_cnt,
+  output logic [ROB_DEPTH*CNT_W-1:0]        dft_n_pkts,
+  output logic [ROB_DEPTH*SLOT_PTR_W-1:0]    dft_slot_head
 );
 
-  // slot ring
+  // slot ring: occupancy gives full/empty; pointers wrap at ROB_DEPTH
   localparam int OCC_W = $clog2(ROB_DEPTH + 1);
   logic [PTR_W-1:0] alloc_ptr;
   logic [PTR_W-1:0] retire_ptr;
@@ -106,7 +121,7 @@ module rmc_cif_rrob #(
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00;
   wire retire_fire  = RESP_VALID & RESP_READY;
 
-  // metadata RAM: written at SEG_LAST from rseg, read out on the resp extras
+  // metadata RAM (unreset, reads X until written): written at SEG_LAST from rseg, read out on the resp extras
   // layout (MSB->LSB): {len[8], size[3], start_offset[PKT_OFF_W], head_mem_ptr[SLOT_PTR_W]}
   logic [META_W-1:0] mem_meta [ROB_DEPTH];
   always_ff @(posedge aclk)
@@ -115,6 +130,23 @@ module rmc_cif_rrob #(
   assign RESP_SIZE     = mem_meta[retire_ptr][SLOT_PTR_W+PKT_OFF_W +: 3];
   assign RESP_OFFSET   = mem_meta[retire_ptr][SLOT_PTR_W +: PKT_OFF_W];
   assign RESP_HEAD_PTR = mem_meta[retire_ptr][SLOT_PTR_W-1:0];
+
+
+  // DFT taps (wiring only; no logic)
+  assign dft_alloc_ptr     = alloc_ptr;
+  assign dft_retire_ptr    = retire_ptr;
+  assign dft_occ           = occ;
+  assign dft_admit_fire    = admit_fire;
+  assign dft_retire_fire   = retire_fire;
+  assign dft_pending_split = pending_split;
+  for (genvar i = 0; i < ROB_DEPTH; i++) begin : g_dft_slot
+    assign dft_inflow_complt[i]              = inflow_complt[i];
+    assign dft_ent_err[i]                    = ent_err[i];
+    assign dft_ent_derr[i]                   = ent_derr[i];
+    assign dft_outflow_cnt[i*CNT_W +: CNT_W] = outflow_cnt[i];
+    assign dft_n_pkts[i*CNT_W +: CNT_W]      = n_pkts[i];
+    assign dft_slot_head[i*SLOT_PTR_W +: SLOT_PTR_W] = mem_meta[i][SLOT_PTR_W-1:0];
+  end
 
   // all flop updates (admit / SEG_LAST / cmpl / retire are parallel)
   always_ff @(posedge aclk or negedge aresetn) begin

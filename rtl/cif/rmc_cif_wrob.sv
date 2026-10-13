@@ -50,10 +50,25 @@ module rmc_cif_wrob #(
   input  logic                   RESP_READY,
   output logic [AXI_IDW-1:0]     RESP_ID,
   output logic [1:0]             RESP_RESP,        // 00 OKAY / 10 SLVERR
-  output logic [SLOT_W-1:0]      RESP_HEAD_PTR     // chain head (for slot free at retire)
+  output logic [SLOT_W-1:0]      RESP_HEAD_PTR,    // chain head (for slot free at retire)
+
+  // DFT taps (passive, output only; no effect on ROB state). Per-slot buses are
+  // slot-major: slot i occupies bits [i*W +: W].
+  output logic [PTR_W-1:0]                  dft_alloc_ptr,    // slot being filled/split
+  output logic [PTR_W-1:0]                  dft_retire_ptr,   // oldest slot
+  output logic [$clog2(ROB_DEPTH+1)-1:0]    dft_occ,          // entries in flight
+  output logic                              dft_admit_fire,
+  output logic                              dft_retire_fire,
+  output logic                              dft_pending_split, // slot handed to segmenter
+  output logic [ROB_DEPTH-1:0]              dft_inflow_complt,
+  output logic [ROB_DEPTH-1:0]              dft_ent_err,      // validation-fail flag per slot
+  output logic [ROB_DEPTH-1:0]              dft_ent_derr,     // downstream-error flag per slot
+  output logic [ROB_DEPTH*CNT_W-1:0]        dft_outflow_cnt,
+  output logic [ROB_DEPTH*CNT_W-1:0]        dft_n_pkts,
+  output logic [ROB_DEPTH*SLOT_W-1:0]        dft_slot_head
 );
 
-  // slot ring
+  // slot ring: occupancy gives full/empty; pointers wrap at ROB_DEPTH
   localparam int OCC_W = $clog2(ROB_DEPTH + 1);
   logic [PTR_W-1:0] alloc_ptr;
   logic [PTR_W-1:0] retire_ptr;
@@ -96,6 +111,23 @@ module rmc_cif_wrob #(
   always_ff @(posedge aclk)
     if (SEG_LAST) chain_head[alloc_ptr] <= SEG_HEAD_PTR;
   assign RESP_HEAD_PTR = chain_head[retire_ptr];
+
+
+  // DFT taps (wiring only; no logic)
+  assign dft_alloc_ptr     = alloc_ptr;
+  assign dft_retire_ptr    = retire_ptr;
+  assign dft_occ           = occ;
+  assign dft_admit_fire    = admit_fire;
+  assign dft_retire_fire   = retire_fire;
+  assign dft_pending_split = pending_split;
+  for (genvar i = 0; i < ROB_DEPTH; i++) begin : g_dft_slot
+    assign dft_inflow_complt[i]              = inflow_complt[i];
+    assign dft_ent_err[i]                    = ent_err[i];
+    assign dft_ent_derr[i]                   = ent_derr[i];
+    assign dft_outflow_cnt[i*CNT_W +: CNT_W] = outflow_cnt[i];
+    assign dft_n_pkts[i*CNT_W +: CNT_W]      = n_pkts[i];
+    assign dft_slot_head[i*SLOT_W +: SLOT_W] = chain_head[i];
+  end
 
   // all flop updates (admit / SEG_LAST / cmpl / retire are parallel)
   always_ff @(posedge aclk or negedge aresetn) begin

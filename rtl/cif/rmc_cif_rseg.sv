@@ -70,7 +70,11 @@ module rmc_cif_rseg #(
   output logic [N_CH-1:0]                packet_last_in_txn,
   output logic [N_CH-1:0][SLOT_W-1:0]    packet_slot,      // slot = slot_base + pkt_num
   output logic [N_CH-1:0][PKT_OFF_W-1:0] packet_offset,    // start byte in packet 0
-  output logic [N_CH-1:0]                packet_narrow     // not a full-width 64B line
+  output logic [N_CH-1:0]                packet_narrow,    // not a full-width 64B line
+
+  // DFT taps (passive, output only)
+  output logic                   dft_busy,         // a request is being split
+  output logic [CNT_W-1:0]       dft_pkt_cnt       // packets issued so far
 );
 
   // captured request (held through the split; req_in_* is the NEXT request after)
@@ -94,6 +98,8 @@ module rmc_cif_rseg #(
   assign off_aligned = req_offset & ~PKT_OFF_W'((SPAN_W'(1) << req_size) - 1'b1);
   assign span        = SPAN_W'(off_aligned) + ((SPAN_W'(req_len) + 1'b1) << req_size);
   assign n_pkts      = (span + SPAN_W'(PKT_BYTES - 1)) >> PKT_OFF_W;
+  // NPKTS is derived from the captured request regs, so only meaningful while busy;
+  // it truncates to CNT_W bits if a request needs more than MAX_PKTS packets.
   assign SEG_NPKTS   = CNT_W'(n_pkts);
 
   // window: the next N_CH packets, each mapped to {channel, DRAM coords}
@@ -191,6 +197,10 @@ module rmc_cif_rseg #(
       end
     end
   end
+
+  // DFT taps (wiring only)
+  assign dft_busy    = busy;
+  assign dft_pkt_cnt = pkt_cnt;
 
   // read meta from the captured copy (req_in_* has moved on by SEG_LAST)
   assign SEG_OFFSET   = req_offset;
