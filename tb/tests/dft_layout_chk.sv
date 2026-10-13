@@ -18,6 +18,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
 );
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1;
   localparam int PTR_W     = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1;
+  localparam int QPTR_W    = PTR_W + 1;
   localparam int OCC_W     = $clog2(ROB_DEPTH + 1);
   localparam int CNT_W     = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1;
   localparam int PKT_NUM_W = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS)   : 1;
@@ -59,7 +60,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
   logic [1-1:0] aw_ok;
   logic [1-1:0] ar_ok;
   logic [ROB_IDX_W-1:0] rd_rob_index;
-  logic [1-1:0] rd_idx_vld;
+  logic [1-1:0] rd_rob_ready;
   logic [1-1:0] rd_alloc_vld;
   logic [PTR_W-1:0] rd_head;
   logic [PTR_W-1:0] rd_tail;
@@ -95,9 +96,15 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
   logic [AXI_IDW-1:0] wr_resp_id;
   logic [2-1:0] wr_resp_resp;
   logic [WDB_AW-1:0] wr_resp_head;
-  logic [1-1:0] rs_busy;
-  logic [CNT_W-1:0] rs_pkt_cnt;
+  logic [1-1:0] rs_ready;
+  logic [QPTR_W-1:0] rs_q_alloc;
+  logic [QPTR_W-1:0] rs_q_pop;
+  logic [ROB_DEPTH*N_CH-1:0] rs_q_ch_done;
+  logic [N_CH*QPTR_W-1:0] rs_eng_rd_ptr;
+  logic [N_CH*CNT_W-1:0] rs_eng_m;
+  logic [RDB_AW-1:0] rs_req_dbuf_base;
   logic [1-1:0] rs_seg_last;
+  logic [ROB_IDX_W-1:0] rs_seg_rob_idx;
   logic [CNT_W-1:0] rs_seg_npkts;
   logic [PKT_OFF_W-1:0] rs_seg_offset;
   logic [8-1:0] rs_seg_len;
@@ -105,13 +112,10 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
   logic [RDB_AW-1:0] rs_seg_head;
   logic [N_CH-1:0] rs_pkt_valid;
   logic [N_CH-1:0] rs_pkt_ready;
-  logic [N_CH*ROB_IDX_W-1:0] rs_pkt_rob_index;
+  logic [N_CH-1:0] rs_pkt_dbuf_rdy;
+  logic [N_CH*ROB_IDX_W-1:0] rs_pkt_rob_idx;
   logic [N_CH*DADDR_W-1:0] rs_pkt_daddr;
-  logic [N_CH*PKT_NUM_W-1:0] rs_pkt_num;
-  logic [N_CH-1:0] rs_pkt_last;
-  logic [N_CH*RDB_AW-1:0] rs_pkt_slot;
-  logic [N_CH*PKT_OFF_W-1:0] rs_pkt_offset;
-  logic [N_CH-1:0] rs_pkt_narrow;
+  logic [N_CH*RDB_AW-1:0] rs_pkt_dbuf_adr;
   logic [1-1:0] ws_seg_last;
   logic [CNT_W-1:0] ws_seg_npkts;
   logic [WDB_AW-1:0] ws_seg_head;
@@ -178,7 +182,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
     .aw_ok(aw_ok),
     .ar_ok(ar_ok),
     .rd_rob_index(rd_rob_index),
-    .rd_idx_vld(rd_idx_vld),
+    .rd_rob_ready(rd_rob_ready),
     .rd_alloc_vld(rd_alloc_vld),
     .rd_head(rd_head),
     .rd_tail(rd_tail),
@@ -214,9 +218,15 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
     .wr_resp_id(wr_resp_id),
     .wr_resp_resp(wr_resp_resp),
     .wr_resp_head(wr_resp_head),
-    .rs_busy(rs_busy),
-    .rs_pkt_cnt(rs_pkt_cnt),
+    .rs_ready(rs_ready),
+    .rs_q_alloc(rs_q_alloc),
+    .rs_q_pop(rs_q_pop),
+    .rs_q_ch_done(rs_q_ch_done),
+    .rs_eng_rd_ptr(rs_eng_rd_ptr),
+    .rs_eng_m(rs_eng_m),
+    .rs_req_dbuf_base(rs_req_dbuf_base),
     .rs_seg_last(rs_seg_last),
+    .rs_seg_rob_idx(rs_seg_rob_idx),
     .rs_seg_npkts(rs_seg_npkts),
     .rs_seg_offset(rs_seg_offset),
     .rs_seg_len(rs_seg_len),
@@ -224,13 +234,10 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
     .rs_seg_head(rs_seg_head),
     .rs_pkt_valid(rs_pkt_valid),
     .rs_pkt_ready(rs_pkt_ready),
-    .rs_pkt_rob_index(rs_pkt_rob_index),
+    .rs_pkt_dbuf_rdy(rs_pkt_dbuf_rdy),
+    .rs_pkt_rob_idx(rs_pkt_rob_idx),
     .rs_pkt_daddr(rs_pkt_daddr),
-    .rs_pkt_num(rs_pkt_num),
-    .rs_pkt_last(rs_pkt_last),
-    .rs_pkt_slot(rs_pkt_slot),
-    .rs_pkt_offset(rs_pkt_offset),
-    .rs_pkt_narrow(rs_pkt_narrow),
+    .rs_pkt_dbuf_adr(rs_pkt_dbuf_adr),
     .ws_seg_last(ws_seg_last),
     .ws_seg_npkts(ws_seg_npkts),
     .ws_seg_head(ws_seg_head),
@@ -272,7 +279,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
     for (int b = 0; b < 4096; b += 32) tmp[b +: 32] = $urandom;
   endtask
 
-  localparam int CAT_W = (1) + (1) + (AXI_AW) + (8) + (3) + (AXI_IDW) + (1) + (1) + (AXI_AW) + (8) + (3) + (AXI_IDW) + (1) + (1) + (AXI_DW/8) + (1) + (1) + (1) + (1) + (1) + (DADDR_W) + (DADDR_W) + (CH_W) + (CH_W) + (PKT_OFF_W) + (PKT_OFF_W) + (DEC_W*MAP_SEL_W) + (1) + (1) + (ROB_IDX_W) + (1) + (1) + (PTR_W) + (PTR_W) + (OCC_W) + (1) + (1) + (ROB_DEPTH) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH) + (ROB_DEPTH) + (ROB_DEPTH*RDB_AW) + (AXI_IDW) + (2) + (RDB_AW) + (PKT_OFF_W) + (8) + (3) + (ROB_IDX_W) + (1) + (1) + (PTR_W) + (PTR_W) + (OCC_W) + (1) + (1) + (ROB_DEPTH) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH) + (ROB_DEPTH) + (ROB_DEPTH*WDB_AW) + (AXI_IDW) + (2) + (WDB_AW) + (1) + (CNT_W) + (1) + (CNT_W) + (PKT_OFF_W) + (8) + (3) + (RDB_AW) + (N_CH) + (N_CH) + (N_CH*ROB_IDX_W) + (N_CH*DADDR_W) + (N_CH*PKT_NUM_W) + (N_CH) + (N_CH*RDB_AW) + (N_CH*PKT_OFF_W) + (N_CH) + (1) + (CNT_W) + (WDB_AW) + (1) + (N_CH) + (N_CH) + (N_CH*ROB_IDX_W) + (N_CH*DADDR_W) + (N_CH*PKT_NUM_W) + (N_CH) + (N_CH*WDB_AW) + (N_CH*PKT_OFF_W) + (N_CH) + (1) + (1) + (ROB_IDX_W) + (1) + (DADDR_W) + (PKT_NUM_W) + (1) + (SLOT_W) + (1) + (1) + (ROB_IDX_W) + (1) + (WDB_AW) + (SRAM_W) + (1) + (RDB_AW) + (SRAM_W) + (1) + (1);
+  localparam int CAT_W = (1) + (1) + (AXI_AW) + (8) + (3) + (AXI_IDW) + (1) + (1) + (AXI_AW) + (8) + (3) + (AXI_IDW) + (1) + (1) + (AXI_DW/8) + (1) + (1) + (1) + (1) + (1) + (DADDR_W) + (DADDR_W) + (CH_W) + (CH_W) + (PKT_OFF_W) + (PKT_OFF_W) + (DEC_W*MAP_SEL_W) + (1) + (1) + (ROB_IDX_W) + (1) + (1) + (PTR_W) + (PTR_W) + (OCC_W) + (1) + (1) + (ROB_DEPTH) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH) + (ROB_DEPTH) + (ROB_DEPTH*RDB_AW) + (AXI_IDW) + (2) + (RDB_AW) + (PKT_OFF_W) + (8) + (3) + (ROB_IDX_W) + (1) + (1) + (PTR_W) + (PTR_W) + (OCC_W) + (1) + (1) + (ROB_DEPTH) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH*CNT_W) + (ROB_DEPTH) + (ROB_DEPTH) + (ROB_DEPTH*WDB_AW) + (AXI_IDW) + (2) + (WDB_AW) + (1) + (QPTR_W) + (QPTR_W) + (ROB_DEPTH*N_CH) + (N_CH*QPTR_W) + (N_CH*CNT_W) + (RDB_AW) + (1) + (ROB_IDX_W) + (CNT_W) + (PKT_OFF_W) + (8) + (3) + (RDB_AW) + (N_CH) + (N_CH) + (N_CH) + (N_CH*ROB_IDX_W) + (N_CH*DADDR_W) + (N_CH*RDB_AW) + (1) + (CNT_W) + (WDB_AW) + (1) + (N_CH) + (N_CH) + (N_CH*ROB_IDX_W) + (N_CH*DADDR_W) + (N_CH*PKT_NUM_W) + (N_CH) + (N_CH*WDB_AW) + (N_CH*PKT_OFF_W) + (N_CH) + (1) + (1) + (ROB_IDX_W) + (1) + (DADDR_W) + (PKT_NUM_W) + (1) + (SLOT_W) + (1) + (1) + (ROB_IDX_W) + (1) + (WDB_AW) + (SRAM_W) + (1) + (RDB_AW) + (SRAM_W) + (1) + (1);
   // expc: expected bus, built by concatenation in reverse field order (MSB first)
   logic [CAT_W-1:0] expc;
   // 20 iterations: new random inputs, then compare the bus with the concatenation.
@@ -312,7 +319,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
       rnd(0); aw_ok = tmp[1-1:0];
       rnd(0); ar_ok = tmp[1-1:0];
       rnd(0); rd_rob_index = tmp[ROB_IDX_W-1:0];
-      rnd(0); rd_idx_vld = tmp[1-1:0];
+      rnd(0); rd_rob_ready = tmp[1-1:0];
       rnd(0); rd_alloc_vld = tmp[1-1:0];
       rnd(0); rd_head = tmp[PTR_W-1:0];
       rnd(0); rd_tail = tmp[PTR_W-1:0];
@@ -348,9 +355,15 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
       rnd(0); wr_resp_id = tmp[AXI_IDW-1:0];
       rnd(0); wr_resp_resp = tmp[2-1:0];
       rnd(0); wr_resp_head = tmp[WDB_AW-1:0];
-      rnd(0); rs_busy = tmp[1-1:0];
-      rnd(0); rs_pkt_cnt = tmp[CNT_W-1:0];
+      rnd(0); rs_ready = tmp[1-1:0];
+      rnd(0); rs_q_alloc = tmp[QPTR_W-1:0];
+      rnd(0); rs_q_pop = tmp[QPTR_W-1:0];
+      rnd(0); rs_q_ch_done = tmp[ROB_DEPTH*N_CH-1:0];
+      rnd(0); rs_eng_rd_ptr = tmp[N_CH*QPTR_W-1:0];
+      rnd(0); rs_eng_m = tmp[N_CH*CNT_W-1:0];
+      rnd(0); rs_req_dbuf_base = tmp[RDB_AW-1:0];
       rnd(0); rs_seg_last = tmp[1-1:0];
+      rnd(0); rs_seg_rob_idx = tmp[ROB_IDX_W-1:0];
       rnd(0); rs_seg_npkts = tmp[CNT_W-1:0];
       rnd(0); rs_seg_offset = tmp[PKT_OFF_W-1:0];
       rnd(0); rs_seg_len = tmp[8-1:0];
@@ -358,13 +371,10 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
       rnd(0); rs_seg_head = tmp[RDB_AW-1:0];
       rnd(0); rs_pkt_valid = tmp[N_CH-1:0];
       rnd(0); rs_pkt_ready = tmp[N_CH-1:0];
-      rnd(0); rs_pkt_rob_index = tmp[N_CH*ROB_IDX_W-1:0];
+      rnd(0); rs_pkt_dbuf_rdy = tmp[N_CH-1:0];
+      rnd(0); rs_pkt_rob_idx = tmp[N_CH*ROB_IDX_W-1:0];
       rnd(0); rs_pkt_daddr = tmp[N_CH*DADDR_W-1:0];
-      rnd(0); rs_pkt_num = tmp[N_CH*PKT_NUM_W-1:0];
-      rnd(0); rs_pkt_last = tmp[N_CH-1:0];
-      rnd(0); rs_pkt_slot = tmp[N_CH*RDB_AW-1:0];
-      rnd(0); rs_pkt_offset = tmp[N_CH*PKT_OFF_W-1:0];
-      rnd(0); rs_pkt_narrow = tmp[N_CH-1:0];
+      rnd(0); rs_pkt_dbuf_adr = tmp[N_CH*RDB_AW-1:0];
       rnd(0); ws_seg_last = tmp[1-1:0];
       rnd(0); ws_seg_npkts = tmp[CNT_W-1:0];
       rnd(0); ws_seg_head = tmp[WDB_AW-1:0];
@@ -398,7 +408,7 @@ module dft_layout_chk import rmc_cfg_pkg::*; #(
       rnd(0); aclk = tmp[1-1:0];
       rnd(0); aresetn = tmp[1-1:0];
       #1;   // let the combinational bus settle
-      expc = {aresetn, aclk, rdb_dout, rdb_addr, rdb_re, wdb_din, wdb_addr, wdb_we, async_mc_cmpl_rob_index, async_mc_cmpl_ready, async_mc_cmpl_valid, async_mc_req_sram_slot, async_mc_req_last_in_txn, async_mc_req_pkt_num, async_mc_req_daddr, async_mc_req_op, async_mc_req_rob_index, async_mc_req_ready, async_mc_req_valid, ws_pkt_narrow, ws_pkt_offset, ws_pkt_slot, ws_pkt_last, ws_pkt_num, ws_pkt_daddr, ws_pkt_rob_index, ws_pkt_ready, ws_pkt_valid, ws_free_slot_take, ws_seg_head, ws_seg_npkts, ws_seg_last, rs_pkt_narrow, rs_pkt_offset, rs_pkt_slot, rs_pkt_last, rs_pkt_num, rs_pkt_daddr, rs_pkt_rob_index, rs_pkt_ready, rs_pkt_valid, rs_seg_head, rs_seg_size, rs_seg_len, rs_seg_offset, rs_seg_npkts, rs_seg_last, rs_pkt_cnt, rs_busy, wr_resp_head, wr_resp_resp, wr_resp_id, wr_slot_head, wr_ent_derr, wr_ent_err, wr_n_pkts, wr_outflow_cnt, wr_inflow_complt, wr_retire_fire, wr_retire_vld, wr_occ, wr_tail, wr_head, wr_alloc_vld, wr_idx_vld, wr_rob_index, rd_resp_size, rd_resp_len, rd_resp_offset, rd_resp_head, rd_resp_resp, rd_resp_id, rd_slot_head, rd_ent_derr, rd_ent_err, rd_n_pkts, rd_outflow_cnt, rd_inflow_complt, rd_retire_fire, rd_retire_vld, rd_occ, rd_tail, rd_head, rd_alloc_vld, rd_idx_vld, rd_rob_index, ar_ok, aw_ok, addr_map, ar_off, aw_off, ar_ch, aw_ch, ar_daddr, aw_daddr, rready, rvalid, bready, bvalid, wlast, wstrb, wready, wvalid, arid, arsize, arlen, araddr, arready, arvalid, awid, awsize, awlen, awaddr, awready, awvalid};
+      expc = {aresetn, aclk, rdb_dout, rdb_addr, rdb_re, wdb_din, wdb_addr, wdb_we, async_mc_cmpl_rob_index, async_mc_cmpl_ready, async_mc_cmpl_valid, async_mc_req_sram_slot, async_mc_req_last_in_txn, async_mc_req_pkt_num, async_mc_req_daddr, async_mc_req_op, async_mc_req_rob_index, async_mc_req_ready, async_mc_req_valid, ws_pkt_narrow, ws_pkt_offset, ws_pkt_slot, ws_pkt_last, ws_pkt_num, ws_pkt_daddr, ws_pkt_rob_index, ws_pkt_ready, ws_pkt_valid, ws_free_slot_take, ws_seg_head, ws_seg_npkts, ws_seg_last, rs_pkt_dbuf_adr, rs_pkt_daddr, rs_pkt_rob_idx, rs_pkt_dbuf_rdy, rs_pkt_ready, rs_pkt_valid, rs_seg_head, rs_seg_size, rs_seg_len, rs_seg_offset, rs_seg_npkts, rs_seg_rob_idx, rs_seg_last, rs_req_dbuf_base, rs_eng_m, rs_eng_rd_ptr, rs_q_ch_done, rs_q_pop, rs_q_alloc, rs_ready, wr_resp_head, wr_resp_resp, wr_resp_id, wr_slot_head, wr_ent_derr, wr_ent_err, wr_n_pkts, wr_outflow_cnt, wr_inflow_complt, wr_retire_fire, wr_retire_vld, wr_occ, wr_tail, wr_head, wr_alloc_vld, wr_idx_vld, wr_rob_index, rd_resp_size, rd_resp_len, rd_resp_offset, rd_resp_head, rd_resp_resp, rd_resp_id, rd_slot_head, rd_ent_derr, rd_ent_err, rd_n_pkts, rd_outflow_cnt, rd_inflow_complt, rd_retire_fire, rd_retire_vld, rd_occ, rd_tail, rd_head, rd_alloc_vld, rd_rob_ready, rd_rob_index, ar_ok, aw_ok, addr_map, ar_off, aw_off, ar_ch, aw_ch, ar_daddr, aw_daddr, rready, rvalid, bready, bvalid, wlast, wstrb, wready, wvalid, arid, arsize, arlen, araddr, arready, arvalid, awid, awsize, awlen, awaddr, awready, awvalid};
       // a width disagreement counts as an error; !== so X on the bus is a mismatch
       if (OBS_W !== CAT_W || dft_obs !== expc) errors++;
       iters++;

@@ -18,6 +18,7 @@ module tb_rmc_cif;
   // TB's own width derivations (same guarded convention as the RTL)
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1;
   localparam int PTR_W     = ROB_IDX_W;
+  localparam int QPTR_W    = PTR_W + 1;     // rseg queue pointer = index + wrap bit
   localparam int OCC_W     = $clog2(ROB_DEPTH + 1);
   localparam int CNT_W     = (MAX_PKTS > 1) ? $clog2(MAX_PKTS+1)  : 1;
   localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS)    : 1;
@@ -47,8 +48,9 @@ module tb_rmc_cif;
     t += 2 * (depth*cnt + 2*depth + idw + 2);          // n_pkts, ent_err/derr, resp_id/resp
     t += depth*ra + ra + 6 + 8 + 3;                    // read: slot_head, resp head/off/len/size
     t += depth*wa + wa;                                // write: slot_head, resp head
-    t += 1 + cnt + 1 + cnt + 6 + 8 + 3 + ra;           // read seg state/seg_*
-    t += NCH * (1 + 1 + rob_idx + DADDR_W + pn + 1 + ra + PKT_OFF_W + 1);
+    t += 1 + 2*(ptr+1) + depth*NCH + NCH*(ptr+1) + NCH*cnt + ra;   // rseg: ready, q ptrs, ch_done, walkers, dbuf_base
+    t += 1 + rob_idx + cnt + 6 + 8 + 3 + ra;          // rseg seg_* bundle
+    t += NCH * (1 + 1 + 1 + rob_idx + DADDR_W + ra);   // rseg pkt_*: valid, ready, dbuf_rdy, rob_idx, daddr, dbuf_adr
     t += 1 + cnt + wa + 1;                             // write seg seg_*/free_slot_take
     t += NCH * (1 + 1 + rob_idx + DADDR_W + pn + 1 + wa + PKT_OFF_W + 1);
     t += 1 + 1 + rob_idx + 1 + DADDR_W + pn + 1 + sl + 1 + 1 + rob_idx;
@@ -164,6 +166,14 @@ module tb_rmc_cif;
   dft_layout_chk #(8, 48, 16, 64, 64,  4) lchk4 (lc_err_v[4*32 +: 32], lc_bus_v[4*32 +: 32], lc_cat_v[4*32 +: 32], lc_it_v[4*32 +: 32]);
   dft_layout_chk #(16,48,  5,  7,  2, 16) lchk5 (lc_err_v[5*32 +: 32], lc_bus_v[5*32 +: 32], lc_cat_v[5*32 +: 32], lc_it_v[5*32 +: 32]);
 
+  // Walker state read straight from each per-channel engine (independent of rseg's flattening).
+  logic [N_CH*QPTR_W-1:0] src_eng_rd;
+  logic [N_CH*CNT_W-1:0]  src_eng_m;
+  for (genvar c = 0; c < N_CH; c++) begin : g_src
+    assign src_eng_rd[c*QPTR_W +: QPTR_W] = dut.u_rseg.g_ch[c].u_ch.rd_ptr;
+    assign src_eng_m[c*CNT_W +: CNT_W]    = dut.u_rseg.g_ch[c].u_ch.m;
+  end
+
   // ---- bookkeeping ----
   // per-class counters; BLOCKED items are only counted, never added to a pass total
   int n_impl_pass = 0, n_impl_fail = 0;
@@ -203,7 +213,7 @@ module tb_rmc_cif;
   int o_wvalid, o_wready, o_wstrb, o_wlast, o_bvalid, o_bready, o_rvalid, o_rready;
   int o_aw_daddr, o_ar_daddr, o_aw_ch, o_ar_ch, o_aw_off, o_ar_off, o_addr_map;
   int o_aw_ok, o_ar_ok;
-  int o_rd_rob_index, o_rd_idx_vld, o_rd_alloc_vld, o_rd_head, o_rd_tail, o_rd_occ;
+  int o_rd_rob_index, o_rd_rob_ready, o_rd_alloc_vld, o_rd_head, o_rd_tail, o_rd_occ;
   int o_rd_retire_vld, o_rd_retire_fire, o_rd_inflow, o_rd_outflow;
   int o_wr_rob_index, o_wr_idx_vld, o_wr_alloc_vld, o_wr_head, o_wr_tail, o_wr_occ;
   int o_wr_retire_vld, o_wr_retire_fire, o_wr_inflow, o_wr_outflow;
@@ -213,8 +223,9 @@ module tb_rmc_cif;
   int o_rd_npkts, o_rd_eerr, o_rd_ederr, o_rd_shead, o_rd_rid, o_rd_rresp, o_rd_rhead;
   int o_rd_roff, o_rd_rlen, o_rd_rsize;
   int o_wr_npkts, o_wr_eerr, o_wr_ederr, o_wr_shead, o_wr_rid, o_wr_rresp, o_wr_rhead;
-  int o_rs_busy, o_rs_cnt, o_rs_last, o_rs_npkts, o_rs_off, o_rs_len, o_rs_size, o_rs_head;
-  int o_rs_pv, o_rs_pr, o_rs_prob, o_rs_pdaddr, o_rs_pnum, o_rs_plast, o_rs_pslot, o_rs_poff, o_rs_pnar;
+  int o_rs_ready, o_rs_qa, o_rs_qp, o_rs_chd, o_rs_erp, o_rs_em, o_rs_dbase;
+  int o_rs_last, o_rs_srob, o_rs_npkts, o_rs_off, o_rs_len, o_rs_size, o_rs_head;
+  int o_rs_pv, o_rs_pr, o_rs_pdr, o_rs_prob, o_rs_pdaddr, o_rs_pdbuf;
   int o_ws_last, o_ws_npkts, o_ws_head, o_ws_take;
   int o_ws_pv, o_ws_pr, o_ws_prob, o_ws_pdaddr, o_ws_pnum, o_ws_plast, o_ws_pslot, o_ws_poff, o_ws_pnar;
   int o_aclk, o_aresetn;
@@ -236,7 +247,7 @@ module tb_rmc_cif;
     fld(o_aw_off,PKT_OFF_W); fld(o_ar_off,PKT_OFF_W);
     fld(o_addr_map,DEC_W*MAP_SEL_W);
     fld(o_aw_ok,1); fld(o_ar_ok,1);
-    fld(o_rd_rob_index,ROB_IDX_W); fld(o_rd_idx_vld,1); fld(o_rd_alloc_vld,1);
+    fld(o_rd_rob_index,ROB_IDX_W); fld(o_rd_rob_ready,1); fld(o_rd_alloc_vld,1);
     fld(o_rd_head,PTR_W); fld(o_rd_tail,PTR_W); fld(o_rd_occ,OCC_W);
     fld(o_rd_retire_vld,1); fld(o_rd_retire_fire,1);
     fld(o_rd_inflow,ROB_DEPTH); fld(o_rd_outflow,ROB_DEPTH*CNT_W);
@@ -251,11 +262,12 @@ module tb_rmc_cif;
     fld(o_wr_npkts,ROB_DEPTH*CNT_W); fld(o_wr_eerr,ROB_DEPTH); fld(o_wr_ederr,ROB_DEPTH);
     fld(o_wr_shead,ROB_DEPTH*WDB_AW);
     fld(o_wr_rid,AXI_IDW); fld(o_wr_rresp,2); fld(o_wr_rhead,WDB_AW);
-    fld(o_rs_busy,1); fld(o_rs_cnt,CNT_W); fld(o_rs_last,1); fld(o_rs_npkts,CNT_W);
+    fld(o_rs_ready,1); fld(o_rs_qa,QPTR_W); fld(o_rs_qp,QPTR_W); fld(o_rs_chd,ROB_DEPTH*N_CH);
+    fld(o_rs_erp,N_CH*QPTR_W); fld(o_rs_em,N_CH*CNT_W); fld(o_rs_dbase,RDB_AW);
+    fld(o_rs_last,1); fld(o_rs_srob,ROB_IDX_W); fld(o_rs_npkts,CNT_W);
     fld(o_rs_off,PKT_OFF_W); fld(o_rs_len,8); fld(o_rs_size,3); fld(o_rs_head,RDB_AW);
-    fld(o_rs_pv,N_CH); fld(o_rs_pr,N_CH); fld(o_rs_prob,N_CH*ROB_IDX_W);
-    fld(o_rs_pdaddr,N_CH*DADDR_W); fld(o_rs_pnum,N_CH*PKT_NUM_W); fld(o_rs_plast,N_CH);
-    fld(o_rs_pslot,N_CH*RDB_AW); fld(o_rs_poff,N_CH*PKT_OFF_W); fld(o_rs_pnar,N_CH);
+    fld(o_rs_pv,N_CH); fld(o_rs_pr,N_CH); fld(o_rs_pdr,N_CH); fld(o_rs_prob,N_CH*ROB_IDX_W);
+    fld(o_rs_pdaddr,N_CH*DADDR_W); fld(o_rs_pdbuf,N_CH*RDB_AW);
     fld(o_ws_last,1); fld(o_ws_npkts,CNT_W); fld(o_ws_head,WDB_AW); fld(o_ws_take,1);
     fld(o_ws_pv,N_CH); fld(o_ws_pr,N_CH); fld(o_ws_prob,N_CH*ROB_IDX_W);
     fld(o_ws_pdaddr,N_CH*DADDR_W); fld(o_ws_pnum,N_CH*PKT_NUM_W); fld(o_ws_plast,N_CH);
@@ -306,7 +318,7 @@ module tb_rmc_cif;
     cmp("aw_ok", o_aw_ok, 1, z | dut.aw_ok);     cmp("ar_ok", o_ar_ok, 1, z | dut.ar_ok);
     // read ROB: sources are the ROB's own existing signals
     cmp("rd_rob_index", o_rd_rob_index, ROB_IDX_W, z | dut.u_rrob.ROB_IDX);
-    cmp("rd_idx_vld", o_rd_idx_vld, 1, z | dut.u_rrob.pending_split);
+    cmp("rd_rob_ready", o_rd_rob_ready, 1, z | dut.u_rrob.A_ID_READY);
     cmp("rd_alloc_vld", o_rd_alloc_vld, 1, z | dut.u_rrob.admit_fire);
     cmp("rd_head", o_rd_head, PTR_W, z | dut.u_rrob.retire_ptr);
     cmp("rd_tail", o_rd_tail, PTR_W, z | dut.u_rrob.alloc_ptr);
@@ -348,23 +360,27 @@ module tb_rmc_cif;
       cmp("wr_slot_head", o_wr_shead + i*WDB_AW, WDB_AW, z | dut.u_wrob.chain_head[i]);
     end
     // segmenters: sources are the instance's own ports / state
-    cmp("rs_busy", o_rs_busy, 1, z | dut.u_rseg.busy);
-    cmp("rs_pkt_cnt", o_rs_cnt, CNT_W, z | dut.u_rseg.pkt_cnt);
-    cmp("rs_seg_last", o_rs_last, 1, z | dut.u_rseg.SEG_LAST);
-    cmp("rs_seg_npkts", o_rs_npkts, CNT_W, z | dut.u_rseg.SEG_NPKTS);
-    cmp("rs_seg_offset", o_rs_off, PKT_OFF_W, z | dut.u_rseg.SEG_OFFSET);
-    cmp("rs_seg_len", o_rs_len, 8, z | dut.u_rseg.SEG_LEN);
-    cmp("rs_seg_size", o_rs_size, 3, z | dut.u_rseg.SEG_SIZE);
-    cmp("rs_seg_head", o_rs_head, RDB_AW, z | dut.u_rseg.SEG_HEAD_PTR);
-    cmp("rs_pkt_valid", o_rs_pv, N_CH, z | dut.u_rseg.packet_valid);
-    cmp("rs_pkt_ready", o_rs_pr, N_CH, z | dut.u_rseg.packet_ready);
-    cmp("rs_pkt_rob_index", o_rs_prob, N_CH*ROB_IDX_W, z | dut.u_rseg.packet_rob_index);
-    cmp("rs_pkt_daddr", o_rs_pdaddr, N_CH*DADDR_W, z | dut.u_rseg.packet_daddr);
-    cmp("rs_pkt_num", o_rs_pnum, N_CH*PKT_NUM_W, z | dut.u_rseg.packet_pkt_num);
-    cmp("rs_pkt_last", o_rs_plast, N_CH, z | dut.u_rseg.packet_last_in_txn);
-    cmp("rs_pkt_slot", o_rs_pslot, N_CH*RDB_AW, z | dut.u_rseg.packet_slot);
-    cmp("rs_pkt_offset", o_rs_poff, N_CH*PKT_OFF_W, z | dut.u_rseg.packet_offset);
-    cmp("rs_pkt_narrow", o_rs_pnar, N_CH, z | dut.u_rseg.packet_narrow);
+    cmp("rs_ready", o_rs_ready, 1, z | dut.u_rseg.ready);
+    cmp("rs_q_alloc", o_rs_qa, QPTR_W, z | dut.u_rseg.alloc_ptr);
+    cmp("rs_q_pop", o_rs_qp, QPTR_W, z | dut.u_rseg.pop_ptr);
+    for (int e = 0; e < ROB_DEPTH; e++)
+      cmp("rs_q_ch_done", o_rs_chd + e*N_CH, N_CH, z | dut.u_rseg.ch_done[e]);
+    cmp("rs_eng_rd_ptr", o_rs_erp, N_CH*QPTR_W, z | src_eng_rd);
+    cmp("rs_eng_m", o_rs_em, N_CH*CNT_W, z | src_eng_m);
+    cmp("rs_req_dbuf_base", o_rs_dbase, RDB_AW, z | dut.u_rseg.req_dbuf_base);
+    cmp("rs_seg_last", o_rs_last, 1, z | dut.u_rseg.seg_last);
+    cmp("rs_seg_rob_idx", o_rs_srob, ROB_IDX_W, z | dut.u_rseg.seg_rob_idx);
+    cmp("rs_seg_npkts", o_rs_npkts, CNT_W, z | dut.u_rseg.seg_npkts);
+    cmp("rs_seg_offset", o_rs_off, PKT_OFF_W, z | dut.u_rseg.seg_offset);
+    cmp("rs_seg_len", o_rs_len, 8, z | dut.u_rseg.seg_len);
+    cmp("rs_seg_size", o_rs_size, 3, z | dut.u_rseg.seg_size);
+    cmp("rs_seg_head", o_rs_head, RDB_AW, z | dut.u_rseg.seg_head_ptr);
+    cmp("rs_pkt_valid", o_rs_pv, N_CH, z | dut.u_rseg.pkt_valid);
+    cmp("rs_pkt_ready", o_rs_pr, N_CH, z | dut.u_rseg.pkt_ready);
+    cmp("rs_pkt_dbuf_rdy", o_rs_pdr, N_CH, z | dut.u_rseg.pkt_dbuf_adr_ready);
+    cmp("rs_pkt_rob_idx", o_rs_prob, N_CH*ROB_IDX_W, z | dut.u_rseg.pkt_rob_idx);
+    cmp("rs_pkt_daddr", o_rs_pdaddr, N_CH*DADDR_W, z | dut.u_rseg.pkt_daddr);
+    cmp("rs_pkt_dbuf_adr", o_rs_pdbuf, N_CH*RDB_AW, z | dut.u_rseg.pkt_dbuf_adr);
     cmp("ws_seg_last", o_ws_last, 1, z | dut.u_wseg.SEG_LAST);
     cmp("ws_seg_npkts", o_ws_npkts, CNT_W, z | dut.u_wseg.SEG_NPKTS);
     cmp("ws_seg_head", o_ws_head, WDB_AW, z | dut.u_wseg.SEG_HEAD_PTR);
@@ -499,34 +515,31 @@ module tb_rmc_cif;
     chk_impl(slice(o_rd_tail, PTR_W) === 0,     {where, ": read tail == 0"});
     chk_impl(slice(o_wr_head, PTR_W) === 0,     {where, ": write head == 0"});
     chk_impl(slice(o_wr_tail, PTR_W) === 0,     {where, ": write tail == 0"});
-    chk_impl(slice(o_rd_idx_vld, 1) === 0,      {where, ": read idx_vld == 0"});
+    chk_impl(slice(o_rs_qa, QPTR_W) === 0 && slice(o_rs_qp, QPTR_W) === 0 && slice(o_rs_erp, N_CH*QPTR_W) === 0,
+             {where, ": rseg queue and walker pointers == 0"});
+    chk_impl(slice(o_rs_ready, 1) === 1,        {where, ": rseg queue ready"});
     chk_impl(slice(o_wr_idx_vld, 1) === 0,      {where, ": write idx_vld == 0"});
     chk_impl(slice(o_rd_retire_vld, 1) === 0,   {where, ": read retire_vld == 0"});
     chk_impl(slice(o_wr_retire_vld, 1) === 0,   {where, ": write retire_vld == 0"});
   endtask
 
 
-  // ---- ROB sequence with segmenter-side pins forced (SEGF): no producer at the top ----
+  // ---- write-ROB sequence with segmenter-side pins forced (SEGF): wseg is a stub ----
   // Static tasks below: iverilog rejects automatic variables in force statements.
   task force_seg(input bit wr, input bit last, input int npk, input int hd,
                            input int off, input int len, input int size);
-    if (!wr) begin
-      force dut.u_rrob.SEG_LAST = last;           force dut.u_rrob.SEG_NPKTS = CNT_W'(npk);
-      force dut.u_rrob.SEG_HEAD_PTR = RDB_AW'(hd); force dut.u_rrob.SEG_OFFSET = PKT_OFF_W'(off);
-      force dut.u_rrob.SEG_LEN = 8'(len);         force dut.u_rrob.SEG_SIZE = 3'(size);
-    end else begin
-      force dut.u_wrob.SEG_LAST = last;           force dut.u_wrob.SEG_NPKTS = CNT_W'(npk);
-      force dut.u_wrob.SEG_HEAD_PTR = WDB_AW'(hd);
-    end
+    // write ROB only: the read ROB's SEG_* are driven by rseg through the top now
+    force dut.u_wrob.SEG_LAST = last;           force dut.u_wrob.SEG_NPKTS = CNT_W'(npk);
+    force dut.u_wrob.SEG_HEAD_PTR = WDB_AW'(hd);
   endtask
 
-  // Force RESP_READY and cmpl_err on one ROB (both unwired at the top).
+  // Force RESP_READY and cmpl_err on one ROB (both unwired at the top, read and write).
   task force_rsp(input bit wr, input bit ready, input bit err);
     if (!wr) begin force dut.u_rrob.RESP_READY = ready; force dut.u_rrob.cmpl_err = err; end
     else     begin force dut.u_wrob.RESP_READY = ready; force dut.u_wrob.cmpl_err = err; end
   endtask
 
-  // Fill, backpressure, out-of-order completion, stall and in-order drain of one ROB.
+  // Fill, backpressure, out-of-order completion, stall and in-order drain (write ROB).
   task automatic rob_forced_test(input bit wr);
     string  nm;
     int     o_idx, o_alloc, o_head, o_tail, o_occ, o_rv, o_rf, o_infl, o_out, o_np, o_sh;
@@ -535,7 +548,7 @@ module tb_rmc_cif;
     int     m_hd [ROB_DEPTH];
     int     nslot, retired;
     nm      = wr ? "wrob" : "rrob";
-    o_idx   = wr ? o_wr_idx_vld : o_rd_idx_vld;   o_alloc = wr ? o_wr_alloc_vld : o_rd_alloc_vld;
+    o_idx   = o_wr_idx_vld;                       o_alloc = wr ? o_wr_alloc_vld : o_rd_alloc_vld;
     o_head  = wr ? o_wr_head : o_rd_head;         o_tail  = wr ? o_wr_tail : o_rd_tail;
     o_occ   = wr ? o_wr_occ : o_rd_occ;           o_rv    = wr ? o_wr_retire_vld : o_rd_retire_vld;
     o_rf    = wr ? o_wr_retire_fire : o_rd_retire_fire;
@@ -623,14 +636,154 @@ module tb_rmc_cif;
     #1;
     chk_segf(slice(o_occ,OCC_W) === 0 && slice(o_head,PTR_W) === 0 && slice(o_tail,PTR_W) === 0 &&
              slice(o_rv,1) === 0, $sformatf("%s drained: occ 0, head == tail == 0 after one full wrap", nm));
-    if (!wr) begin
-      release dut.u_rrob.SEG_LAST; release dut.u_rrob.SEG_NPKTS; release dut.u_rrob.SEG_HEAD_PTR;
-      release dut.u_rrob.SEG_OFFSET; release dut.u_rrob.SEG_LEN; release dut.u_rrob.SEG_SIZE;
-      release dut.u_rrob.RESP_READY; release dut.u_rrob.cmpl_err;
-    end else begin
-      release dut.u_wrob.SEG_LAST; release dut.u_wrob.SEG_NPKTS; release dut.u_wrob.SEG_HEAD_PTR;
-      release dut.u_wrob.RESP_READY; release dut.u_wrob.cmpl_err;
+    release dut.u_wrob.SEG_LAST; release dut.u_wrob.SEG_NPKTS; release dut.u_wrob.SEG_HEAD_PTR;
+    release dut.u_wrob.RESP_READY; release dut.u_wrob.cmpl_err;
+  endtask
+
+  // ---- integrated read path (T10): AR -> rseg queue -> walkers -> rrob via the top wiring ----
+  // Downstream stubs are forced because they are unfinished upstream: ar_pkt_ready (req FIFOs),
+  // ar_dbuf_base (RD-SRAM allocator) and rrob RESP_READY. Static task: force needs static vars.
+  logic [N_CH-1:0]   f_rdy;
+  logic [RDB_AW-1:0] f_base;
+  int                rb_cnt = 0;          // batches run, makes request ids unique
+
+  task rd_batch(input int R, input int rdy_mode, input bit ooo, input bit one_err);
+    int  i, k, c, cyc, cnt, idx0, occ0, kk, nxt, nret, seg_cnt, sl, sz, ri, nslot;
+    logic [AXI_AWD-1:0] sa, la, last_byte;
+    logic [AXI_AWD-1:0] sa_a  [ROB_DEPTH];
+    int                 sl_a  [ROB_DEPTH];
+    int                 sz_a  [ROB_DEPTH];
+    int                 bs_a  [ROB_DEPTH];
+    int                 np_a  [ROB_DEPTH];
+    bit                 ok_a  [ROB_DEPTH];
+    logic [63:0]        seen  [ROB_DEPTH];
+    int                 lastk [ROB_DEPTH][N_CH];
+    nslot = 1 << RDB_AW;
+    rb_cnt++;
+    f_rdy = '0;
+    force dut.ar_pkt_ready = f_rdy;
+    force dut.u_rrob.RESP_READY = 1'b1;
+    idx0 = int'(slice(o_rd_tail, PTR_W));
+    occ0 = int'(slice(o_rd_occ, OCC_W));
+    // admit R requests back-to-back with the downstream blocked
+    for (i = 0; i < R; i++) begin
+      sa = {$urandom, $urandom} & ((AXI_AWD'(1) << MAP_ADDR_W) - 1);
+      sl = $urandom % 32;  sz = $urandom % 5;
+      ok_a[i] = !(one_err && i == 1);
+      if (!ok_a[i]) sa = sa | (AXI_AWD'(1) << MAP_ADDR_W);
+      last_byte = ((sa >> sz) << sz) + AXI_AWD'((sl + 1) << sz) - 1;   // INCR burst byte range
+      np_a[i] = int'((last_byte >> PKT_OFF_W) - (sa >> PKT_OFF_W)) + 1;
+      sa_a[i] = sa;  sl_a[i] = sl;  sz_a[i] = sz;  bs_a[i] = $urandom % nslot;
+      seen[i] = '0;
+      for (c = 0; c < N_CH; c++) lastk[i][c] = -1;
+      f_base = RDB_AW'(bs_a[i]);
+      force dut.ar_dbuf_base = f_base;
+      arvalid = 1; arid = AXI_IDW'(16 + i + 64*rb_cnt); araddr = sa; arlen = 8'(sl); arsize = 3'(sz);
+      #1;
+      chk_segf(arready === 1'b1, $sformatf("b%0d req%0d: arready high with room", rb_cnt, i));
+      tick();
+      chk_segf(slice(o_rd_occ, OCC_W) === occ0 + i + 1 &&
+               slice(o_rd_tail, PTR_W) === (idx0 + i + 1) % ROB_DEPTH,
+               $sformatf("b%0d req%0d: occ/alloc_ptr advance at admit", rb_cnt, i));
+      chk_segf(slice(o_rd_npkts + ((idx0 + i) % ROB_DEPTH)*CNT_W, CNT_W) === np_a[i] &&
+               slice(o_rd_inflow + ((idx0 + i) % ROB_DEPTH), 1) === 0,
+               $sformatf("b%0d req%0d: n_pkts %0d written at admit, not yet sealed", rb_cnt, i, np_a[i]));
     end
+    arvalid = 0;
+    if (R == ROB_DEPTH) begin       // ring full: no further admit
+      arvalid = 1; arid = 8'hEE; #1;
+      chk_segf(arready === 1'b0 && slice(o_rd_alloc_vld, 1) === 0, $sformatf("b%0d full: arready low, no admit", rb_cnt));
+      tick(); arvalid = 0; #1;
+    end
+    chk_segf((slice(o_rs_qa, QPTR_W) - slice(o_rs_qp, QPTR_W)) % (2*ROB_DEPTH) === R &&
+             slice(o_rs_last, 1) === 0, $sformatf("b%0d: queue holds %0d, no seg_last while blocked", rb_cnt, R));
+    // drain: per-channel ready pattern; check every consumed packet and every seg_last
+    seg_cnt = 0;
+    for (cyc = 0; cyc < 800 && seg_cnt < R; cyc++) begin
+      case (rdy_mode)
+        0: f_rdy = '1;
+        1: f_rdy = (cyc % 2) ? '1 : N_CH'(1);
+        default: f_rdy = N_CH'($urandom);
+      endcase
+      force dut.ar_pkt_ready = f_rdy;
+      #1;
+      for (c = 0; c < N_CH; c++) begin
+        if (dut.u_rseg.pkt_valid[c] === 1'b1 && f_rdy[c]) begin
+          ri = (int'(dut.u_rseg.pkt_rob_idx[c]) - idx0 + ROB_DEPTH) % ROB_DEPTH;
+          if (ri >= R) chk_segf(0, $sformatf("b%0d: packet tagged with unexpected rob_idx %0d", rb_cnt, dut.u_rseg.pkt_rob_idx[c]));
+          else begin
+            kk = (int'(dut.u_rseg.pkt_dbuf_adr[c]) - bs_a[ri] + nslot) % nslot;
+            la = (((sa_a[ri] >> PKT_OFF_W) + AXI_AWD'(kk)) << PKT_OFF_W);
+            chk_segf(kk < np_a[ri], $sformatf("b%0d req%0d: packet index %0d < n_pkts %0d", rb_cnt, ri, kk, np_a[ri]));
+            chk_segf(c == int'(ref_ch(la)), $sformatf("b%0d req%0d pkt%0d on its mapped channel", rb_cnt, ri, kk));
+            chk_segf(dut.u_rseg.pkt_daddr[c] === ref_daddr(la), $sformatf("b%0d req%0d pkt%0d daddr", rb_cnt, ri, kk));
+            chk_segf(kk < 64 && !seen[ri][kk], $sformatf("b%0d req%0d pkt%0d issued once", rb_cnt, ri, kk));
+            // channel order: no skipped packet of this channel
+            nxt = lastk[ri][c] + 1;
+            while (nxt < np_a[ri] && int'(ref_ch(((sa_a[ri] >> PKT_OFF_W) + AXI_AWD'(nxt)) << PKT_OFF_W)) != c) nxt++;
+            chk_segf(kk == nxt, $sformatf("b%0d req%0d ch%0d in order (got %0d want %0d)", rb_cnt, ri, c, kk, nxt));
+            if (kk < 64) seen[ri][kk] = 1'b1;
+            lastk[ri][c] = kk;
+          end
+        end
+      end
+      if (dut.u_rseg.seg_last === 1'b1) begin
+        ri = (int'(dut.u_rseg.seg_rob_idx) - idx0 + ROB_DEPTH) % ROB_DEPTH;
+        chk_segf(ri == seg_cnt, $sformatf("b%0d: seg_last #%0d is request %0d (program order)", rb_cnt, seg_cnt, ri));
+        if (ri < R) begin
+          chk_segf(seen[ri] === ((64'd1 << np_a[ri]) - 1), $sformatf("b%0d req%0d: all packets issued before seg_last", rb_cnt, ri));
+          chk_segf(dut.u_rseg.seg_npkts === CNT_W'(np_a[ri]) && dut.u_rseg.seg_offset === PKT_OFF_W'(sa_a[ri][PKT_OFF_W-1:0]) &&
+                   dut.u_rseg.seg_len === 8'(sl_a[ri]) && dut.u_rseg.seg_size === 3'(sz_a[ri]) &&
+                   dut.u_rseg.seg_head_ptr === RDB_AW'(bs_a[ri]), $sformatf("b%0d req%0d: seg_* bundle", rb_cnt, ri));
+        end
+        seg_cnt++;
+      end
+      check_dft_all();
+      tick();
+    end
+    chk_segf(seg_cnt == R, $sformatf("b%0d: all %0d requests segmented", rb_cnt, R));
+    chk_segf(slice(o_rs_qa, QPTR_W) === slice(o_rs_qp, QPTR_W), $sformatf("b%0d: queue drained", rb_cnt));
+    if (R == ROB_DEPTH) begin       // queue has room but the ROB is full: ROB must backpressure
+      arvalid = 1; arid = 8'hED; #1;
+      chk_segf(slice(o_rs_ready, 1) === 1 && arready === 1'b0 && slice(o_rd_alloc_vld, 1) === 0,
+               $sformatf("b%0d: ROB-full backpressure with an empty queue", rb_cnt));
+      tick(); arvalid = 0; #1;
+    end
+    // completions from the MC side through the real port; out of order if requested
+    nret = 0;
+    for (i = 0; i < R; i++) begin
+      ri = ooo ? (R - 1 - i) : i;
+      for (k = 0; k < np_a[ri]; k++) begin
+        cmpl_rob = ROB_IDX_W'((idx0 + ri) % ROB_DEPTH); cmpl_valid = 1;
+        tick(); cmpl_valid = 0; #1;
+        if (slice(o_rd_retire_vld, 1) === 1 && slice(o_rd_retire_fire, 1) === 1) begin
+          chk_segf(slice(o_rd_rid, AXI_IDW) === (16 + nret + 64*rb_cnt) % 256, $sformatf("b%0d retire %0d: RESP_ID in program order", rb_cnt, nret));
+          chk_segf(slice(o_rd_rresp, 2) === (ok_a[nret] ? 2'b00 : 2'b10), $sformatf("b%0d retire %0d: RESP_RESP", rb_cnt, nret));
+          chk_segf(slice(o_rd_rhead, RDB_AW) === bs_a[nret] && slice(o_rd_roff, PKT_OFF_W) === sa_a[nret][PKT_OFF_W-1:0] &&
+                   slice(o_rd_rlen, 8) === sl_a[nret] && slice(o_rd_rsize, 3) === sz_a[nret],
+                   $sformatf("b%0d retire %0d: resp meta", rb_cnt, nret));
+          nret++;
+        end
+      end
+    end
+    // let the remaining retirements ripple out (one per cycle)
+    for (cyc = 0; cyc < ROB_DEPTH + 4 && nret < R; cyc++) begin
+      tick();   // the entry sampled last cycle retires at this edge; look at the next head
+      if (slice(o_rd_retire_vld, 1) === 1 && slice(o_rd_retire_fire, 1) === 1) begin
+        chk_segf(slice(o_rd_rid, AXI_IDW) === (16 + nret + 64*rb_cnt) % 256, $sformatf("b%0d retire %0d: RESP_ID in program order", rb_cnt, nret));
+        chk_segf(slice(o_rd_rresp, 2) === (ok_a[nret] ? 2'b00 : 2'b10), $sformatf("b%0d retire %0d: RESP_RESP", rb_cnt, nret));
+        chk_segf(slice(o_rd_rhead, RDB_AW) === bs_a[nret] && slice(o_rd_roff, PKT_OFF_W) === sa_a[nret][PKT_OFF_W-1:0] &&
+                 slice(o_rd_rlen, 8) === sl_a[nret] && slice(o_rd_rsize, 3) === sz_a[nret],
+                 $sformatf("b%0d retire %0d: resp meta", rb_cnt, nret));
+        nret++;
+      end
+      check_dft_all();
+    end
+    chk_segf(nret == R, $sformatf("b%0d: all %0d requests retired", rb_cnt, R));
+    tick();   // the last retire fires at this edge
+    chk_segf(slice(o_rd_occ, OCC_W) === occ0 && slice(o_rd_tail, PTR_W) === (idx0 + R) % ROB_DEPTH &&
+             slice(o_rd_head, PTR_W) === (idx0 + R) % ROB_DEPTH, $sformatf("b%0d: ROB back to idle", rb_cnt));
+    release dut.ar_pkt_ready; release dut.ar_dbuf_base; release dut.u_rrob.RESP_READY;
   endtask
 
   // ---- main ----
@@ -653,8 +806,8 @@ module tb_rmc_cif;
     chk_impl($bits(dft_obs_min) == MIN_OBS_W,
              "guard corner (ROB_DEPTH=1, MAX_PKTS=1) elaborates with expected dft_obs width");
     chk_impl($bits(dft_obs_alt) == ALT_OBS_W, "alt config (D=3,P=3,WDB=8,RDB=64) dft_obs width");
-    chk_impl($bits(dut_alt.u_rrob.RESP_HEAD_PTR) == 6 && $bits(dut_alt.u_rseg.SEG_HEAD_PTR) == 6 &&
-             $bits(dut_alt.u_rseg.packet_slot) == N_CH*6,
+    chk_impl($bits(dut_alt.u_rrob.RESP_HEAD_PTR) == 6 && $bits(dut_alt.u_rseg.seg_head_ptr) == 6 &&
+             $bits(dut_alt.u_rseg.pkt_dbuf_adr) == N_CH*6,
              "alt config: read slot widths follow N_RDB (6)");
     chk_impl($bits(dut_alt.u_wrob.RESP_HEAD_PTR) == 3 && $bits(dut_alt.u_wseg.SEG_HEAD_PTR) == 3 &&
              $bits(dut_alt.u_wseg.packet_slot) == N_CH*3,
@@ -668,7 +821,7 @@ module tb_rmc_cif;
                          c, lc_bus_v[c*32 +: 32], lc_cat_v[c*32 +: 32], lc_err_v[c*32 +: 32]));
     chk_impl(lc_bus_v[0 +: 32] == OBS_W_EXP && lc_bus_v[32 +: 32] == MIN_OBS_W,
              "layout checker widths agree with the TB's independent width sum");
-    chk_impl(OBS_W_EXP == 3115, "default-config dft_obs width is 3115 (2022 base + 1093 ROB/segmenter taps)");
+    chk_impl(OBS_W_EXP == 3196, "default-config dft_obs width is 3196 (3115 before the read-path rework)");
     // default-config widths named in the task
     chk_impl(DADDR_W == 34 && CH_W == 1 && PKT_OFF_W == 6 && DEC_W == 41 && MAP_SEL_W == 6,
              "package widths DADDR_W/CH_W/PKT_OFF_W/DEC_W/MAP_SEL_W");
@@ -749,7 +902,8 @@ module tb_rmc_cif;
     blocked("request validation: illegal size and burst-end-out-of-range checks are TODO in rmc_cif_reqvalidator");
 
     // ---- T3 AXI admission (AW and AR independent) ---------------------------
-    // One admit per ROB through the real AXI ports; pending_split then holds ready low.
+    // One admit per ROB through the real AXI ports. Write: pending_split holds ready low;
+    // read: admit is decoupled from the split (ready stays high).
     do_reset(2);
     check_rob_reset("T3 start");
     // ready does not depend on valid: high with valid low
@@ -784,11 +938,12 @@ module tb_rmc_cif;
     chk_impl(slice(o_rd_occ, OCC_W) === 1 && slice(o_wr_occ, OCC_W) === 1,
              "read and write occ both 1 (separate state)");
     chk_impl(dut.u_rrob.ent_id[0] === 8'h3C, "read ROB slot0 holds the AR id");
-    chk_impl(arready === 1'b0, "arready low while read request mid-split");
+    chk_impl(arready === 1'b1 && slice(o_rd_tail, PTR_W) === 1 && slice(o_rd_head, PTR_W) === 0,
+             "read: arready stays high, alloc_ptr advanced at admit (multi-outstanding)");
+    chk_impl(slice(o_rd_npkts, CNT_W) === 1, "read n_pkts[0] written at admit (64B request == 1 packet)");
     check_dft_all();
     check_tied("after admits");
-    blocked("ROB full backpressure at the integrated top: SEG_LAST not wired, so a 2nd admit cannot be made (covered only with forced pins, T11)");
-    blocked("ROB slot allocation at the integrated top: alloc_ptr only advances on SEG_LAST (unconnected; covered only with forced pins, T11)");
+    blocked("write ROB full backpressure / slot allocation: wseg is a stub so SEG_LAST never arrives (covered only with forced pins, T11)");
 
     // ---- T4 err-tagged admission -------------------------------------------
     // Out-of-range requests are still admitted and carry the error flag.
@@ -823,14 +978,14 @@ module tb_rmc_cif;
     tick(); tick(); #1;
     chk_impl(outflow_of(0,0) === 2 && outflow_of(1,0) === 2, "outflow_cnt holds with no completion pulse");
     chk_impl(slice(o_rd_retire_vld,1) === 0 && slice(o_wr_retire_vld,1) === 0,
-             "OBSERVED: retire_vld stays 0 (inflow_complt never set: SEG_LAST unconnected)");
+             "OBSERVED: retire_vld stays 0 (nothing seals an entry: read packets never drain, wseg stub)");
     chk_impl(slice(o_rd_inflow,1) === 0 && slice(o_wr_inflow,1) === 0,
              "OBSERVED: inflow_complt[0] == 0 (never set)");
     chk_impl(slice(o_rd_occ, OCC_W) === 1 && slice(o_wr_occ, OCC_W) === 1, "occ stays 1: nothing retires");
     chk_impl(slice(o_rd_head, PTR_W) === 0 && slice(o_wr_head, PTR_W) === 0, "head does not move");
     check_dft_all();
     check_tied("after completions");
-    blocked("ROB retire / in-order retirement at the integrated top: SEG_* and RESP_READY not connected (covered only with forced pins, T11)");
+    blocked("retire at the integrated top: read needs pkt_ready/dbuf_base/RESP_READY (forced in T10), write needs wseg (forced in T11)");
     blocked("completion routing by direction (R vs W ROB): not implemented, both ROBs count every completion");
     blocked("completion error tagging: cmpl_err floating at the CIF (not part of the pulse+rob_index interface)");
 
@@ -889,128 +1044,47 @@ module tb_rmc_cif;
       // functional non-interference: ready comes only from the ROBs' own state
       chk_impl(awready === (~dut.u_wrob.rob_full & ~dut.u_wrob.pending_split),
                "awready equals the write ROB admit condition");
-      chk_impl(arready === (~dut.u_rrob.rob_full & ~dut.u_rrob.pending_split),
-               "arready equals the read ROB admit condition");
+      chk_impl(arready === (dut.u_rseg.ready & ~dut.u_rrob.rob_full),
+               "arready equals rseg ready & read ROB not full");
       // occupancy bounded and defined
       chk_impl(^slice(o_rd_occ, OCC_W) !== 1'bx && ^slice(o_wr_occ, OCC_W) !== 1'bx, "occ defined");
       tick();
       if (i == 150 || i == 300) begin aresetn = 0; #2; aresetn = 1; end
     end
 
-    // ---- T10 read segmenter (inputs forced from the TB; SEGF) ----------------
-    // Undriven rseg inputs forced: packet count, channel, daddr, slot, flags, in-order issue vs. a model.
+    // ---- T10 integrated read path, downstream stubs forced (SEGF) ----------------
+    // Real AR -> queue -> walkers -> rrob; only pkt_ready, dbuf_base, RESP_READY forced.
+    // First, unforced: pkt_ready is undriven upstream, so the packet is never consumed.
     do_reset(2);
-    force dut.r_seg_rob_ready = 1'b0;
-    force dut.r_seg_req_valid = 1'b0;
-    force dut.r_seg_req_addr  = '0;
-    force dut.r_seg_req_len   = '0;
-    force dut.r_seg_req_size  = '0;
-    force dut.r_seg_slot_base = '0;
-    force dut.r_pkt_ready     = '0;
-    tick();
-    chk_segf(dut.u_rseg.busy === 1'b0 && dut.u_rseg.SEG_LAST === 1'b0 &&
-             dut.u_rseg.packet_valid === '0, "idle: busy/SEG_LAST/packet_valid low");
-    chk_segf(slice(o_rs_busy,1) === 0 && slice(o_rs_pv,N_CH) === 0, "idle taps low");
-    check_dft_all();
-    for (int t = 0; t < 40; t++) begin
-      logic [AXI_AWD-1:0] sa;
-      int sl, sz, np, nxt, cnt, ofs, base, rdy_mode, cyc;
-      logic [AXI_AWD-1:0] last_byte;
-      bit tail_part;
-      logic [N_CH-1:0] seen_ch;
-      bit last_seen;
-      case (t)
-        0: begin sa = 48'h0;      sl = 3;  sz = 4; end
-        1: begin sa = 48'h0;      sl = 15; sz = 4; end
-        2: begin sa = 48'h30;     sl = 3;  sz = 4; end
-        3: begin sa = 48'h1000;   sl = 0;  sz = 0; end
-        4: begin sa = 48'h7F;     sl = 7;  sz = 0; end
-        5: begin sa = 48'h3C0;    sl = 31; sz = 4; end
-        default: begin
-          sa = {$urandom, $urandom} & ((AXI_AWD'(1) << MAP_ADDR_W) - 1);
-          sl = $urandom % 32; sz = $urandom % 5;
-        end
-      endcase
-      base = $urandom % N_RDB;
-      rdy_mode = (t < 6) ? 0 : (t % 3);      // 0: all ready, 1: ch0 only, 2: random
-      ofs  = int'(sa[PKT_OFF_W-1:0]);
-      // INCR burst byte range: first beat at sa, later beats size-aligned
-      last_byte = ((sa >> sz) << sz) + AXI_AWD'((sl + 1) << sz) - 1;
-      np   = int'((last_byte >> PKT_OFF_W) - (sa >> PKT_OFF_W)) + 1;
-      tail_part = ((last_byte + 1) % PKT_BYTES) != 0;
-      // issue the request (captured on the next edge)
-      force dut.r_seg_req_valid = 1'b1; force dut.r_seg_req_addr = sa;
-      force dut.r_seg_req_len = 8'(sl); force dut.r_seg_req_size = 3'(sz);
-      force dut.r_seg_slot_base = RDB_AW'(base);
-      force dut.r_seg_rob_ready = 1'b1;
-      tick();
-      force dut.r_seg_req_valid = 1'b0; force dut.r_seg_rob_ready = 1'b0;
-      force dut.r_seg_req_addr = '1; force dut.r_seg_req_len = '1;      // next-request noise
-      #1;
-      chk_segf(dut.u_rseg.busy === 1'b1, $sformatf("t%0d busy after capture", t));
-      chk_segf(dut.u_rseg.SEG_NPKTS === CNT_W'(np), $sformatf("t%0d SEG_NPKTS %0d == %0d", t, dut.u_rseg.SEG_NPKTS, np));
-      chk_segf(dut.u_rseg.SEG_OFFSET === PKT_OFF_W'(ofs) && dut.u_rseg.SEG_LEN === 8'(sl) &&
-               dut.u_rseg.SEG_SIZE === 3'(sz) && dut.u_rseg.SEG_HEAD_PTR === RDB_AW'(base),
-               $sformatf("t%0d read meta latched", t));
-      nxt = 0; last_seen = 0;
-      for (cyc = 0; cyc < 200 && nxt < np; cyc++) begin
-        case (rdy_mode)
-          0: force dut.r_pkt_ready = '1;
-          1: force dut.r_pkt_ready = (cyc % 2) ? '1 : N_CH'(1);
-          default: force dut.r_pkt_ready = N_CH'($urandom);
-        endcase
-        #1;
-        cnt = 0;
-        for (int k = 0; k < N_CH; k++) if (dut.u_rseg.packet_valid[k]) cnt++;
-        for (int k = 0; k < cnt; k++) begin
-          logic found;
-          logic [AXI_AWD-1:0] la;
-          found = 0;
-          la = ((sa >> PKT_OFF_W) + AXI_AWD'(nxt + k)) << PKT_OFF_W;
-          for (int c = 0; c < N_CH; c++)
-            if (dut.u_rseg.packet_valid[c] && int'(dut.u_rseg.packet_pkt_num[c]) == nxt + k) begin
-              found = 1;
-              chk_segf(dut.r_pkt_ready[c] === 1'b1, $sformatf("t%0d pkt%0d issued on a ready channel", t, nxt+k));
-              chk_segf(c == int'(ref_ch(la)), $sformatf("t%0d pkt%0d on mapped channel", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_daddr[c] === ref_daddr(la), $sformatf("t%0d pkt%0d daddr", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_slot[c] === RDB_AW'(base + nxt + k), $sformatf("t%0d pkt%0d slot", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_rob_index[c] === '0, $sformatf("t%0d pkt%0d rob_index", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_last_in_txn[c] === (nxt + k == np - 1),
-                       $sformatf("t%0d pkt%0d last_in_txn", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_offset[c] === ((nxt + k == 0) ? PKT_OFF_W'(ofs) : '0),
-                       $sformatf("t%0d pkt%0d offset", t, nxt+k));
-              chk_segf(dut.u_rseg.packet_narrow[c] ===
-                       (((1 << sz) < AXI_DW/8) || (nxt + k == 0 && ofs != 0) ||
-                        (nxt + k == np - 1 && tail_part)),
-                       $sformatf("t%0d pkt%0d narrow", t, nxt+k));
-            end
-          chk_segf(found, $sformatf("t%0d pkt%0d issued in order", t, nxt+k));
-        end
-        chk_segf(dut.u_rseg.SEG_LAST === ((nxt + cnt == np) && cnt != 0),
-                 $sformatf("t%0d SEG_LAST only with the final packet", t));
-        check_dft_all();
-        if (dut.u_rseg.SEG_LAST === 1'b1) last_seen = 1;
-        nxt += cnt;
-        tick();
-      end
-      chk_segf(nxt == np && last_seen, $sformatf("t%0d all %0d packets issued, SEG_LAST seen", t, np));
-      #1;
-      chk_segf(dut.u_rseg.busy === 1'b0, $sformatf("t%0d busy cleared after last packet", t));
-      chk_segf(dut.u_rseg.packet_valid === '0, $sformatf("t%0d no packets after completion", t));
-    end
-    // rseg is not connected to the ROB: forced activity must not move rrob
-    chk_segf(slice(o_rd_occ, OCC_W) === 0 && slice(o_rd_tail, PTR_W) === 0 && slice(o_rd_idx_vld,1) === 0,
-             "rrob untouched by forced rseg activity (SEG_* not wired)");
-    release dut.r_seg_rob_ready; release dut.r_seg_req_valid; release dut.r_seg_req_addr;
-    release dut.r_seg_req_len;   release dut.r_seg_req_size;  release dut.r_seg_slot_base;
-    release dut.r_pkt_ready;
-    blocked("rseg end-to-end: rseg inputs and SEG_* back to rrob are not wired at the CIF top; checked with forced inputs only");
+    check_rob_reset("T10 start");
+    arvalid = 1; arid = 8'h5A; araddr = 48'h40; arlen = 8'd3; arsize = 3'd4; #1;
+    tick(); arvalid = 0;
+    repeat (8) tick();
+    #1;
+    chk_impl(slice(o_rd_occ, OCC_W) === 1 && (slice(o_rs_qa, QPTR_W) - slice(o_rs_qp, QPTR_W)) === 1,
+             "OBSERVED: unforced AR admitted into the ROB and the rseg queue");
+    chk_impl(slice(o_rs_pv, N_CH) === (N_CH'(1) << int'(ref_ch(48'h40))),
+             "OBSERVED: the owning channel offers its packet");
+    chk_impl(slice(o_rs_last, 1) === 0 && slice(o_rd_inflow, 1) === 0 && slice(o_rs_em, N_CH*CNT_W) === 0 &&
+             slice(o_rd_retire_vld, 1) === 0,
+             "OBSERVED: packet never consumed (pkt_ready undriven): no seg_last, no seal, no retire");
+    do_reset(2);
+    rd_batch(1, 0, 0, 0);
+    rd_batch(1, 1, 0, 0);
+    rd_batch(1, 2, 0, 0);
+    rd_batch(6, 0, 0, 1);       // multi-outstanding, one out-of-range (SLVERR)
+    rd_batch(6, 2, 1, 0);       // random ready, out-of-order completion
+    rd_batch(ROB_DEPTH, 1, 1, 0);  // fill the ring (backpressure), drain, wrap
+    rd_batch(5, 2, 0, 1);
+    rd_batch(ROB_DEPTH, 2, 0, 0);
+    blocked("read path to MC: pkt_* has no req FIFO/arbiter, so rseg packets are consumed only by the forced ar_pkt_ready");
+    blocked("read dbuf: RD-SRAM allocator absent (ar_dbuf_base forced) and dbuf_adr_ready is tied high upstream");
     blocked("requests longer than MAX_PKTS: SEG_NPKTS truncates silently, validator burst-end check is TODO (not tested)");
-    // ---- T11 ROB sequences with forced SEG_*/RESP_READY (SEGF) -----------------
-    // Gives the ROB taps non-trivial values, checked against a TB model; unit level, not integration.
-    rob_forced_test(1'b0);
+
+    // ---- T11 write ROB sequence with forced SEG_*/RESP_READY (SEGF) ------------------
+    // Gives the write-ROB taps non-trivial values (wseg is a stub); unit level, not integration.
     rob_forced_test(1'b1);
-    blocked("ROB<->segmenter handoff and R/B response paths are exercised only with TB-forced pins; not an integration test");
+    blocked("write ROB<->segmenter handoff and B response: exercised only with TB-forced pins; not an integration test");
 
     idle_inputs();
 
@@ -1020,7 +1094,7 @@ module tb_rmc_cif;
     $display("---------------------------------------------------------------");
     $display("IMPL  checks : %0d pass, %0d fail", n_impl_pass, n_impl_fail);
     $display("TIED  checks : %0d pass, %0d fail  (confirm tied-off behaviour only)", n_tied_pass, n_tied_fail);
-    $display("SEGF  checks : %0d pass, %0d fail  (rseg + ROB sequences, forced inputs)", n_segf_pass, n_segf_fail);
+    $display("SEGF  checks : %0d pass, %0d fail  (read path + write ROB, forced pins)", n_segf_pass, n_segf_fail);
     $display("DFT   checks : %0d pass, %0d fail  (bus slice == source net)", n_dft_pass, n_dft_fail);
     $display("BLOCKED items: %0d  (RTL incomplete; NOT counted as pass)", n_blocked);
     if (n_impl_fail + n_tied_fail + n_dft_fail + n_segf_fail == 0) begin

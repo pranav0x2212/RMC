@@ -7,9 +7,10 @@ package rmc_cif_dft_pkg;
   function automatic int dft_obs_w(int AXI_IDW, int AXI_AW, int ROB_DEPTH,
                                    int MAX_PKTS, int N_WDB, int N_RDB);
     // same guarded width expressions as rmc_cif_dft
-    int ROB_IDX_W, PTR_W, OCC_W, CNT_W, PKT_NUM_W, SLOT_W, WDB_AW, RDB_AW, SRAM_W, t;
+    int ROB_IDX_W, PTR_W, QPTR_W, OCC_W, CNT_W, PKT_NUM_W, SLOT_W, WDB_AW, RDB_AW, SRAM_W, t;
     ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)   : 1;
     PTR_W     = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)   : 1;
+    QPTR_W    = PTR_W + 1;
     OCC_W     = $clog2(ROB_DEPTH + 1);
     CNT_W     = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1)  : 1;
     PKT_NUM_W = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS)    : 1;
@@ -52,7 +53,7 @@ package rmc_cif_dft_pkg;
     t += 1;  // ar_ok
     // Read ROB (u_rrob)
     t += ROB_IDX_W;  // rd_rob_index
-    t += 1;  // rd_idx_vld
+    t += 1;  // rd_rob_ready
     t += 1;  // rd_alloc_vld
     t += PTR_W;  // rd_head
     t += PTR_W;  // rd_tail
@@ -90,9 +91,15 @@ package rmc_cif_dft_pkg;
     t += 2;  // wr_resp_resp
     t += WDB_AW;  // wr_resp_head
     // Read segmenter (u_rseg)
-    t += 1;  // rs_busy
-    t += CNT_W;  // rs_pkt_cnt
+    t += 1;  // rs_ready
+    t += QPTR_W;  // rs_q_alloc
+    t += QPTR_W;  // rs_q_pop
+    t += ROB_DEPTH*N_CH;  // rs_q_ch_done
+    t += N_CH*QPTR_W;  // rs_eng_rd_ptr
+    t += N_CH*CNT_W;  // rs_eng_m
+    t += RDB_AW;  // rs_req_dbuf_base
     t += 1;  // rs_seg_last
+    t += ROB_IDX_W;  // rs_seg_rob_idx
     t += CNT_W;  // rs_seg_npkts
     t += PKT_OFF_W;  // rs_seg_offset
     t += 8;  // rs_seg_len
@@ -100,13 +107,10 @@ package rmc_cif_dft_pkg;
     t += RDB_AW;  // rs_seg_head
     t += N_CH;  // rs_pkt_valid
     t += N_CH;  // rs_pkt_ready
-    t += N_CH*ROB_IDX_W;  // rs_pkt_rob_index
+    t += N_CH;  // rs_pkt_dbuf_rdy
+    t += N_CH*ROB_IDX_W;  // rs_pkt_rob_idx
     t += N_CH*DADDR_W;  // rs_pkt_daddr
-    t += N_CH*PKT_NUM_W;  // rs_pkt_num
-    t += N_CH;  // rs_pkt_last
-    t += N_CH*RDB_AW;  // rs_pkt_slot
-    t += N_CH*PKT_OFF_W;  // rs_pkt_offset
-    t += N_CH;  // rs_pkt_narrow
+    t += N_CH*RDB_AW;  // rs_pkt_dbuf_adr
     // Write segmenter (u_wseg, stub)
     t += 1;  // ws_seg_last
     t += CNT_W;  // ws_seg_npkts

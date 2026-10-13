@@ -13,6 +13,7 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   // derived widths: guarded so a parameter of 1 never gives a zero-width field
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1,
   localparam int PTR_W     = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1,
+  localparam int QPTR_W    = PTR_W + 1,
   localparam int OCC_W     = $clog2(ROB_DEPTH + 1),
   localparam int CNT_W     = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1,
   localparam int PKT_NUM_W = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS)   : 1,
@@ -58,7 +59,7 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   input  logic [1-1:0] ar_ok,
   // Read ROB (u_rrob)
   input  logic [ROB_IDX_W-1:0] rd_rob_index,
-  input  logic [1-1:0] rd_idx_vld,
+  input  logic [1-1:0] rd_rob_ready,
   input  logic [1-1:0] rd_alloc_vld,
   input  logic [PTR_W-1:0] rd_head,
   input  logic [PTR_W-1:0] rd_tail,
@@ -96,9 +97,15 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   input  logic [2-1:0] wr_resp_resp,
   input  logic [WDB_AW-1:0] wr_resp_head,
   // Read segmenter (u_rseg)
-  input  logic [1-1:0] rs_busy,
-  input  logic [CNT_W-1:0] rs_pkt_cnt,
+  input  logic [1-1:0] rs_ready,
+  input  logic [QPTR_W-1:0] rs_q_alloc,
+  input  logic [QPTR_W-1:0] rs_q_pop,
+  input  logic [ROB_DEPTH*N_CH-1:0] rs_q_ch_done,
+  input  logic [N_CH*QPTR_W-1:0] rs_eng_rd_ptr,
+  input  logic [N_CH*CNT_W-1:0] rs_eng_m,
+  input  logic [RDB_AW-1:0] rs_req_dbuf_base,
   input  logic [1-1:0] rs_seg_last,
+  input  logic [ROB_IDX_W-1:0] rs_seg_rob_idx,
   input  logic [CNT_W-1:0] rs_seg_npkts,
   input  logic [PKT_OFF_W-1:0] rs_seg_offset,
   input  logic [8-1:0] rs_seg_len,
@@ -106,13 +113,10 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   input  logic [RDB_AW-1:0] rs_seg_head,
   input  logic [N_CH-1:0] rs_pkt_valid,
   input  logic [N_CH-1:0] rs_pkt_ready,
-  input  logic [N_CH*ROB_IDX_W-1:0] rs_pkt_rob_index,
+  input  logic [N_CH-1:0] rs_pkt_dbuf_rdy,
+  input  logic [N_CH*ROB_IDX_W-1:0] rs_pkt_rob_idx,
   input  logic [N_CH*DADDR_W-1:0] rs_pkt_daddr,
-  input  logic [N_CH*PKT_NUM_W-1:0] rs_pkt_num,
-  input  logic [N_CH-1:0] rs_pkt_last,
-  input  logic [N_CH*RDB_AW-1:0] rs_pkt_slot,
-  input  logic [N_CH*PKT_OFF_W-1:0] rs_pkt_offset,
-  input  logic [N_CH-1:0] rs_pkt_narrow,
+  input  logic [N_CH*RDB_AW-1:0] rs_pkt_dbuf_adr,
   // Write segmenter (u_wseg, stub)
   input  logic [1-1:0] ws_seg_last,
   input  logic [CNT_W-1:0] ws_seg_npkts,
@@ -188,8 +192,8 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   localparam int O_ar_ok = O_aw_ok + (1);
   // Read ROB (u_rrob)
   localparam int O_rd_rob_index = O_ar_ok + (1);
-  localparam int O_rd_idx_vld = O_rd_rob_index + (ROB_IDX_W);
-  localparam int O_rd_alloc_vld = O_rd_idx_vld + (1);
+  localparam int O_rd_rob_ready = O_rd_rob_index + (ROB_IDX_W);
+  localparam int O_rd_alloc_vld = O_rd_rob_ready + (1);
   localparam int O_rd_head = O_rd_alloc_vld + (1);
   localparam int O_rd_tail = O_rd_head + (PTR_W);
   localparam int O_rd_occ = O_rd_tail + (PTR_W);
@@ -226,25 +230,28 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   localparam int O_wr_resp_resp = O_wr_resp_id + (AXI_IDW);
   localparam int O_wr_resp_head = O_wr_resp_resp + (2);
   // Read segmenter (u_rseg)
-  localparam int O_rs_busy = O_wr_resp_head + (WDB_AW);
-  localparam int O_rs_pkt_cnt = O_rs_busy + (1);
-  localparam int O_rs_seg_last = O_rs_pkt_cnt + (CNT_W);
-  localparam int O_rs_seg_npkts = O_rs_seg_last + (1);
+  localparam int O_rs_ready = O_wr_resp_head + (WDB_AW);
+  localparam int O_rs_q_alloc = O_rs_ready + (1);
+  localparam int O_rs_q_pop = O_rs_q_alloc + (QPTR_W);
+  localparam int O_rs_q_ch_done = O_rs_q_pop + (QPTR_W);
+  localparam int O_rs_eng_rd_ptr = O_rs_q_ch_done + (ROB_DEPTH*N_CH);
+  localparam int O_rs_eng_m = O_rs_eng_rd_ptr + (N_CH*QPTR_W);
+  localparam int O_rs_req_dbuf_base = O_rs_eng_m + (N_CH*CNT_W);
+  localparam int O_rs_seg_last = O_rs_req_dbuf_base + (RDB_AW);
+  localparam int O_rs_seg_rob_idx = O_rs_seg_last + (1);
+  localparam int O_rs_seg_npkts = O_rs_seg_rob_idx + (ROB_IDX_W);
   localparam int O_rs_seg_offset = O_rs_seg_npkts + (CNT_W);
   localparam int O_rs_seg_len = O_rs_seg_offset + (PKT_OFF_W);
   localparam int O_rs_seg_size = O_rs_seg_len + (8);
   localparam int O_rs_seg_head = O_rs_seg_size + (3);
   localparam int O_rs_pkt_valid = O_rs_seg_head + (RDB_AW);
   localparam int O_rs_pkt_ready = O_rs_pkt_valid + (N_CH);
-  localparam int O_rs_pkt_rob_index = O_rs_pkt_ready + (N_CH);
-  localparam int O_rs_pkt_daddr = O_rs_pkt_rob_index + (N_CH*ROB_IDX_W);
-  localparam int O_rs_pkt_num = O_rs_pkt_daddr + (N_CH*DADDR_W);
-  localparam int O_rs_pkt_last = O_rs_pkt_num + (N_CH*PKT_NUM_W);
-  localparam int O_rs_pkt_slot = O_rs_pkt_last + (N_CH);
-  localparam int O_rs_pkt_offset = O_rs_pkt_slot + (N_CH*RDB_AW);
-  localparam int O_rs_pkt_narrow = O_rs_pkt_offset + (N_CH*PKT_OFF_W);
+  localparam int O_rs_pkt_dbuf_rdy = O_rs_pkt_ready + (N_CH);
+  localparam int O_rs_pkt_rob_idx = O_rs_pkt_dbuf_rdy + (N_CH);
+  localparam int O_rs_pkt_daddr = O_rs_pkt_rob_idx + (N_CH*ROB_IDX_W);
+  localparam int O_rs_pkt_dbuf_adr = O_rs_pkt_daddr + (N_CH*DADDR_W);
   // Write segmenter (u_wseg, stub)
-  localparam int O_ws_seg_last = O_rs_pkt_narrow + (N_CH);
+  localparam int O_ws_seg_last = O_rs_pkt_dbuf_adr + (N_CH*RDB_AW);
   localparam int O_ws_seg_npkts = O_ws_seg_last + (1);
   localparam int O_ws_seg_head = O_ws_seg_npkts + (CNT_W);
   localparam int O_ws_free_slot_take = O_ws_seg_head + (WDB_AW);
@@ -321,10 +328,10 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   assign dft_obs[O_aw_ok +: 1] = aw_ok;
   assign dft_obs[O_ar_ok +: 1] = ar_ok;
 
-  // Read ROB (u_rrob). idx_vld = pending_split; head = retire_ptr, tail = alloc_ptr;
-  // n_pkts = packet count latched at SEG_LAST; slot_head = RD-SRAM head slot per entry.
+  // Read ROB (u_rrob). rob_ready = A_ID_READY; head = retire_ptr, tail = alloc_ptr (next
+  // slot to admit); n_pkts is written at admit; slot_head = RD-SRAM head slot per entry.
   assign dft_obs[O_rd_rob_index +: ROB_IDX_W] = rd_rob_index;
-  assign dft_obs[O_rd_idx_vld +: 1] = rd_idx_vld;
+  assign dft_obs[O_rd_rob_ready +: 1] = rd_rob_ready;
   assign dft_obs[O_rd_alloc_vld +: 1] = rd_alloc_vld;
   assign dft_obs[O_rd_head +: PTR_W] = rd_head;
   assign dft_obs[O_rd_tail +: PTR_W] = rd_tail;
@@ -344,7 +351,7 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   assign dft_obs[O_rd_resp_len +: 8] = rd_resp_len;
   assign dft_obs[O_rd_resp_size +: 3] = rd_resp_size;
 
-  // Write ROB (u_wrob). slot_head = first slot of the write chain per entry.
+  // Write ROB (u_wrob). idx_vld = pending_split; slot_head = first slot of the write chain.
   assign dft_obs[O_wr_rob_index +: ROB_IDX_W] = wr_rob_index;
   assign dft_obs[O_wr_idx_vld +: 1] = wr_idx_vld;
   assign dft_obs[O_wr_alloc_vld +: 1] = wr_alloc_vld;
@@ -363,10 +370,17 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   assign dft_obs[O_wr_resp_resp +: 2] = wr_resp_resp;
   assign dft_obs[O_wr_resp_head +: WDB_AW] = wr_resp_head;
 
-  // Read segmenter (u_rseg): the only implemented splitter; pkt_* are per channel.
-  assign dft_obs[O_rs_busy +: 1] = rs_busy;
-  assign dft_obs[O_rs_pkt_cnt +: CNT_W] = rs_pkt_cnt;
+  // Read segmenter (u_rseg): admit queue + per-channel walkers. q_* = ring pointers and
+  // per-slot done bits; eng_* = each walker's rd_ptr / issued count; pkt_* are per channel.
+  assign dft_obs[O_rs_ready +: 1] = rs_ready;
+  assign dft_obs[O_rs_q_alloc +: QPTR_W] = rs_q_alloc;
+  assign dft_obs[O_rs_q_pop +: QPTR_W] = rs_q_pop;
+  assign dft_obs[O_rs_q_ch_done +: ROB_DEPTH*N_CH] = rs_q_ch_done;
+  assign dft_obs[O_rs_eng_rd_ptr +: N_CH*QPTR_W] = rs_eng_rd_ptr;
+  assign dft_obs[O_rs_eng_m +: N_CH*CNT_W] = rs_eng_m;
+  assign dft_obs[O_rs_req_dbuf_base +: RDB_AW] = rs_req_dbuf_base;
   assign dft_obs[O_rs_seg_last +: 1] = rs_seg_last;
+  assign dft_obs[O_rs_seg_rob_idx +: ROB_IDX_W] = rs_seg_rob_idx;
   assign dft_obs[O_rs_seg_npkts +: CNT_W] = rs_seg_npkts;
   assign dft_obs[O_rs_seg_offset +: PKT_OFF_W] = rs_seg_offset;
   assign dft_obs[O_rs_seg_len +: 8] = rs_seg_len;
@@ -374,13 +388,10 @@ module rmc_cif_dft import rmc_cfg_pkg::*; #(
   assign dft_obs[O_rs_seg_head +: RDB_AW] = rs_seg_head;
   assign dft_obs[O_rs_pkt_valid +: N_CH] = rs_pkt_valid;
   assign dft_obs[O_rs_pkt_ready +: N_CH] = rs_pkt_ready;
-  assign dft_obs[O_rs_pkt_rob_index +: N_CH*ROB_IDX_W] = rs_pkt_rob_index;
+  assign dft_obs[O_rs_pkt_dbuf_rdy +: N_CH] = rs_pkt_dbuf_rdy;
+  assign dft_obs[O_rs_pkt_rob_idx +: N_CH*ROB_IDX_W] = rs_pkt_rob_idx;
   assign dft_obs[O_rs_pkt_daddr +: N_CH*DADDR_W] = rs_pkt_daddr;
-  assign dft_obs[O_rs_pkt_num +: N_CH*PKT_NUM_W] = rs_pkt_num;
-  assign dft_obs[O_rs_pkt_last +: N_CH] = rs_pkt_last;
-  assign dft_obs[O_rs_pkt_slot +: N_CH*RDB_AW] = rs_pkt_slot;
-  assign dft_obs[O_rs_pkt_offset +: N_CH*PKT_OFF_W] = rs_pkt_offset;
-  assign dft_obs[O_rs_pkt_narrow +: N_CH] = rs_pkt_narrow;
+  assign dft_obs[O_rs_pkt_dbuf_adr +: N_CH*RDB_AW] = rs_pkt_dbuf_adr;
 
   // Write segmenter (u_wseg, stub): taps are wired for when logic lands.
   assign dft_obs[O_ws_seg_last +: 1] = ws_seg_last;

@@ -70,11 +70,15 @@ module rmc_cif_wseg #(
   output logic [N_CH-1:0]                packet_narrow
 );
 
-  // TODO: mirror rseg's split math (capture, n_pkts, window map, in-order N_CH walk,
-  //       SEG_LAST/SEG_NPKTS). Replace the contiguous slot with the free-list:
-  //         - pull free_slot per issued packet (free_slot_take), build the chain
-  //         - emit SEG_HEAD_PTR (first slot) + per-packet {slot, prev} to w_rob
-  //       packet_op is write (tie high at the top). No read-meta sideband.
+  // LEFT TO DO: mirror the pipelined read segmenter (rmc_cif_rseg + rmc_cif_rseg_ch):
+  //   - same pre-ROB ring queue + N_CH per-channel stride engines, multi-outstanding,
+  //     in-order head pop -> SEG_LAST + SEG_ROB_IDX to w_rob (wrob needs the same
+  //     multi-outstanding rework rrob just got).
+  //   - n_pkts / k0 / stride math is identical (contract map: ch = low CH_W line bits).
+  //   WRITE-SPECIFIC difference = the slot engine: pull free_slot per issued packet
+  //   (free_slot_take) instead of dbuf_base+k, build the chain (next_ram[slot]), and
+  //   emit SEG_HEAD_PTR (first slot) + per-packet {slot, prev} to w_rob / accumulator.
+  //   packet_op = write (tie high at the top). No read-meta sideband (mask rides WSTRB).
   assign free_slot_take     = 1'b0;
   assign SEG_LAST           = 1'b0;
   assign SEG_NPKTS          = '0;

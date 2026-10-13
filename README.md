@@ -59,8 +59,9 @@ podman run --rm -v "$PWD":/w:Z -w /w docker.io/hdlc/iverilog:latest \
 `rtl/cif/rmc_cif_dft.sv` is a passive tap block: CIF signals in, one packed `dft_obs`
 bus out (also an output port of `rmc_cif`). Fields are packed LSB-first in the order
 of the `O_<field>` localparams; total width is `rmc_cif_dft_pkg::dft_obs_w()`
-(3115 bits at defaults). Taps cover AXI ingress, address map, validator, read/write
-ROB (`rmc_cif_rrob`/`rmc_cif_wrob`), read/write segmenter (`rmc_cif_rseg`/`rmc_cif_wseg`),
+(3196 bits at defaults). Taps cover AXI ingress, address map, validator, read/write
+ROB (`rmc_cif_rrob`/`rmc_cif_wrob`), the read segmenter queue and per-channel walkers
+(`rmc_cif_rseg`/`rmc_cif_rseg_ch`), the write segmenter stub (`rmc_cif_wseg`),
 the MC request/completion boundary, WD/RD SRAM client ports, clock and reset.
 `order_q`, `inflow_cnt` and `ent_valid` do not exist in the RTL and are not tapped.
 
@@ -73,23 +74,26 @@ sim/run_cif.sh sim      # sim only   (iverilog -g2012; exit != 0 on failure)
 unless the TB prints `TB RESULT: PASS`; lint warnings are reported but not fatal.
 
 File lists: `filelists/cif_rtl.f` (RTL, package first), `filelists/cif_tb.f` (RTL + TB).
-`tb_rmc_cif` reports IMPL (implemented logic, bus width/layout), SEGF (read segmenter
-and ROB sequences with segmenter/response pins forced from the TB; unit level, not
-end-to-end), TIED (tied-off outputs only), DFT (bus slice == source net; not a
-functional check) and BLOCKED (RTL incomplete: ROB<->segmenter handoff, completion
-direction routing and error tagging, write segmenter, request builder, W/B/R, SRAM,
-programmable address map). `tb/tests/dft_layout_chk.sv` checks the bus against a plain
+`tb_rmc_cif` reports IMPL (implemented logic, bus width/layout, observed integration
+state), SEGF (pins forced from the TB; see below), TIED (tied-off outputs only), DFT (bus
+slice == source net; not a functional check) and BLOCKED (RTL incomplete: read packets
+to MC, RD-SRAM allocator, R response, completion direction routing and error tagging,
+write segmenter, request builder, W/B paths, SRAM, programmable address map). `tb/tests/dft_layout_chk.sv` checks the bus against a plain
 concatenation of the inputs at several parameter sets.
 
-Segmenter request/handshake nets in `rmc_cif.sv` marked `// undriven` are the
-unfinished handoff; they float exactly as the unconnected pins did before.
+Nets in `rmc_cif.sv` marked `// undriven` (`ar_pkt_ready`, `ar_dbuf_base`, `w_pkt_ready`)
+are the unfinished downstream interfaces; they float exactly as the unconnected pins did.
+Unforced, an AR is admitted and queued but its packet is never consumed, so it never
+seals or retires (checked as an OBSERVED state in T10).
 
 Scope and limits:
-- Only T10/T11 force pins (read segmenter inputs; ROB `SEG_*`, `RESP_READY`, `cmpl_err`).
+- Only T10/T11 force pins. T10 drives real AR requests through the top (admit, rseg queue,
+  walkers, rrob) and forces only the unfinished downstream stubs (`ar_pkt_ready`,
+  `ar_dbuf_base`, rrob `RESP_READY`); T11 forces the write ROB's `SEG_*`/`RESP_READY`.
   Everything else drives the CIF top-level ports. A passing TB shows the taps match their
-  sources and the forced unit sequences behave; it does not show end-to-end CIF correctness.
-- Not integrated upstream: ROB<->segmenter handoff, completion direction routing,
-  write segmenter (stub, tied 0), request builder, W/B/R paths, SRAM.
+  sources and the forced sequences behave; it does not show end-to-end CIF correctness.
+- Not integrated upstream: read packets to MC (req FIFOs/arbiter), RD-SRAM allocator,
+  R response path, completion direction routing, write segmenter (stub, tied 0), W/B paths.
 - Synthesis has not been run (no usable frontend in this environment); lint is Verilator only.
 - `fv/` still references the removed `rmc_cif_rob`; the formal flow is stale and was not touched.
 

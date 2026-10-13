@@ -1,211 +1,235 @@
 // rmc_cif_rseg.sv
-// READ burst segmenter. Splits one admitted read request into 64B-line packets,
-// one CAS each, and streams them to MC via the per-channel req async FIFOs; pulses
-// SEG_LAST + SEG_NPKTS back to r_rob to close inflow, and forwards the read meta
-// {offset, len, size, head slot} for r_rob to latch at SEG_LAST (resp-path trim).
+// READ burst segmenter - full, pipelined. A pre-ROB queue (ring, QUEUE_DEPTH) holds
+// admitted requests; N_CH per-channel engines (rmc_cif_rseg_ch) each walk the ring at
+// their own pace and issue their channel's 64B packets. An entry pops (in order) when
+// every channel has marked it done, pulsing seg_last to the ROB.
 //
-// Packet k = 64B line (addr>>6) + k. The address map is a runtime bit permutation,
-// so the seg steps the LINE number in system-address space and maps each packet
-// itself (one rmc_cif_addrmap per window position, muxes only); the map also gives
-// the packet's channel. Each cycle the next N_CH packets form a window and issue in
-// order: a packet goes when every earlier one went, its channel is free this cycle
-// and that channel's FIFO is ready. Packets never overtake.
+// No lockstep: a channel that owns many packets holds only its own rd_ptr on one entry;
+// the other engines run ahead onto later entries. rob_idx is pre-allocated at enqueue
+// and rides in the queue entry, tagging every packet so MC completions route back.
 //
-// Read slots are CONTIGUOUS from the request base: slot = slot_base + pkt_num (the
-// resp path recomputes offsets from head_ptr+k). Writes are different (free-list) -
-// see rmc_cif_wseg.
+// Queue entry {aligned_base, offset, n_pkts, dbuf_base, rob_idx} is written at enqueue;
+// n_pkts (needs the unaligned offset) is computed here, once. The offset is stored and
+// ridden out on seg_offset for the ROB response trim - engines never touch it.
 //
-// Relies on: INCR bursts only; a request never spans more than MAX_PKTS lines
-// (validator rejects it); addr_map static while a request is split; N_CH pow2.
+// QUEUE_DEPTH must be a power of 2 (ring index wraps on the low bits).
 
 import rmc_cfg_pkg::*;
 
 module rmc_cif_rseg #(
-  parameter int ROB_DEPTH = 32,         // ROB entries             [root knob]
-  parameter int MAX_PKTS  = 64,         // max packets per request [root knob]
-  parameter int AXI_AW    = SYS_ADDR_W, // AXI address width       [root knob]
-  parameter int N_SLOTS   = 32,         // RD-SRAM slots           [root knob]
+  parameter int ROB_DEPTH   = 32,         // ROB entries (rob_idx width)   [root knob]
+  parameter int MAX_PKTS    = 64,         // max packets per request       [root knob]
+  parameter int AXI_AW      = SYS_ADDR_W, // AXI address width             [root knob]
+  parameter int N_SLOTS     = 32,         // RD-SRAM slots                 [root knob]
+  parameter int QUEUE_DEPTH = ROB_DEPTH,  // pre-ROB queue entries; = ROB_DEPTH so a channel
+                                          // can hold every outstanding request (no premature
+                                          // per-channel admit HOL; stalls only on ROB-full) [knob]
 
   // derived (localparam: never passed in)
-  localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1,
-  localparam int PKT_NUM_W = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS)   : 1,
-  localparam int CNT_W     = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1,
-  localparam int SLOT_W    = (N_SLOTS   > 1) ? $clog2(N_SLOTS)    : 1,
-  localparam int LINE_W    = AXI_AW - PKT_OFF_W                    // 64B line number
+  localparam int ROB_IDX_W  = (ROB_DEPTH   > 1) ? $clog2(ROB_DEPTH)   : 1, // rob_idx tag width
+  localparam int CNT_W      = (MAX_PKTS    > 1) ? $clog2(MAX_PKTS+1)  : 1, // packet-count width (0..MAX_PKTS)
+  localparam int SLOT_W     = (N_SLOTS     > 1) ? $clog2(N_SLOTS)     : 1, // RD-SRAM slot index width
+  localparam int LINE_W     = AXI_AW - PKT_OFF_W,                     // 64B line number width
+  localparam int QIDX_W     = (QUEUE_DEPTH > 1) ? $clog2(QUEUE_DEPTH) : 1, // queue ring index width
+  localparam int QPTR_W     = QIDX_W + 1,                             // queue pointer = index + wrap bit
+  localparam int DATA_BYTES = AXI_DW / 8,                            // AXI beat width in bytes (= N_CH*8)
+  localparam int SIZE_MAX   = (DATA_BYTES   > 1) ? $clog2(DATA_BYTES) : 0, // max awsize (log2 bytes/beat)
+  localparam int MAX_BEATS  = MAX_REQ_BYTES / DATA_BYTES,            // max beats in one request
+  localparam int LEN_W      = (MAX_BEATS    > 1) ? $clog2(MAX_BEATS)  : 1, // awlen width (beats-1)
+  localparam int SIZE_W     = (SIZE_MAX     > 0) ? $clog2(SIZE_MAX+1) : 1, // awsize width
+  localparam int SPAN_W     = $clog2(MAX_REQ_BYTES + 1)              // bytes-spanned width (<=4KB)
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
 
-  // request in (from the pre-ROB AR_req buffer): address + burst params. Captured on
-  // req_in_valid & ROB_READY (the admit beat); ROB owns the pop, seg has no ready.
-  input  logic                   req_in_valid,     // buffer seg-half data valid
-  input  logic [AXI_AW-1:0]      req_in_addr,      // system byte address of the request
-  input  logic [7:0]             req_in_len,       // AXI len (beats - 1)
-  input  logic [2:0]             req_in_size,      // AXI size
-  input  logic [SLOT_W-1:0]      req_in_slot_base, // head RD-SRAM slot (contiguous base)
-
-  // live address map (CSR), same bus the validator-side rmc_cif_addrmap uses
+  // live address map (CSR), broadcast to every engine
   input  logic [DEC_W-1:0][MAP_SEL_W-1:0] addr_map,
 
-  // admitted slot index from r_rob + its ready; capture on req_in_valid & ROB_READY
-  input  logic [ROB_IDX_W-1:0]   ROB_IDX,
-  input  logic                   ROB_READY,        // r_rob admit-ready (= its A_ID_READY)
+  // enqueue (one request into the pre-ROB queue)
+  input  logic                   start_req,       // a request is offered this cycle
+  input  logic [AXI_AW-1:0]      req_addr,         // byte start address
+  input  logic [LEN_W-1:0]       req_len,          // ar_len  (beats-1)
+  input  logic [SIZE_W-1:0]      req_size,         // ar_size (log2 beat bytes)
+  input  logic [SLOT_W-1:0]      req_dbuf_base,    // RD-SRAM base slot for this request
+  input  logic [ROB_IDX_W-1:0]   req_rob_idx,      // pre-allocated ROB index (rides the entry)
+  output logic                   ready,            // ~full: queue can accept a request
 
-  // back to r_rob when the split finishes
-  output logic                   SEG_LAST,         // last packet of the request issued
-  output logic [CNT_W-1:0]       SEG_NPKTS,        // packet count of the request
-  // read meta -> r_rob, latched there at SEG_LAST (resp-path pre/post trim)
-  output logic [PKT_OFF_W-1:0]   SEG_OFFSET,       // start byte offset
-  output logic [7:0]             SEG_LEN,          // AXI len
-  output logic [2:0]             SEG_SIZE,         // AXI size
-  output logic [SLOT_W-1:0]      SEG_HEAD_PTR,     // RD-SRAM head slot (= slot_base)
+  // per-channel packet streams out (one req FIFO per channel -> MC)
+  output logic [N_CH-1:0]                pkt_valid,    // packet offered on this channel
+  input  logic [N_CH-1:0]                pkt_ready,    // channel req FIFO can take it
+  input  logic [N_CH-1:0]                pkt_dbuf_adr_ready, // RD-SRAM has a slot for it
+  output logic [N_CH-1:0][ROB_IDX_W-1:0] pkt_rob_idx,  // owning request's ROB index
+  output logic [N_CH-1:0][DADDR_W-1:0]   pkt_daddr,    // mapped DRAM coords for the line
+  output logic [N_CH-1:0][SLOT_W-1:0]    pkt_dbuf_adr, // RD-SRAM slot = dbuf_base + k
 
-  // packet stream out, ONE PER CHANNEL: up to N_CH packets per cycle, one into each
-  // channel's req async FIFO. packet_valid is the FIFO wr_en, gated with packet_ready.
-  output logic [N_CH-1:0]                packet_valid,
-  input  logic [N_CH-1:0]                packet_ready,
-  output logic [N_CH-1:0][ROB_IDX_W-1:0] packet_rob_index, // = ROB_IDX (same all ch)
-  output logic [N_CH-1:0][DADDR_W-1:0]   packet_daddr,     // per-packet DRAM coords
-  output logic [N_CH-1:0][PKT_NUM_W-1:0] packet_pkt_num,   // 0 .. N-1
-  output logic [N_CH-1:0]                packet_last_in_txn,
-  output logic [N_CH-1:0][SLOT_W-1:0]    packet_slot,      // slot = slot_base + pkt_num
-  output logic [N_CH-1:0][PKT_OFF_W-1:0] packet_offset,    // start byte in packet 0
-  output logic [N_CH-1:0]                packet_narrow,    // not a full-width 64B line
+  // to the ROB: one pulse when an entry is fully segmented (in-order head pop),
+  // plus the read meta the ROB latches for the R-response trim.
+  output logic                   seg_last,         // a request finished splitting
+  output logic [ROB_IDX_W-1:0]   seg_rob_idx,      // which ROB entry it was
+  output logic [CNT_W-1:0]       seg_npkts,        // its total packet count
+  output logic [PKT_OFF_W-1:0]   seg_offset,       // unaligned start offset addr[5:0]
+  output logic [LEN_W-1:0]       seg_len,          // ar_len  (beats-1)
+  output logic [SIZE_W-1:0]      seg_size,         // ar_size (log2 beat bytes)
+  output logic [SLOT_W-1:0]      seg_head_ptr,     // RD-SRAM head slot (= dbuf_base)
 
-  // DFT taps (passive, output only)
-  output logic                   dft_busy,         // a request is being split
-  output logic [CNT_W-1:0]       dft_pkt_cnt       // packets issued so far
+  // DFT taps (passive, output only; per-slot / per-channel buses are index-major)
+  output logic [QPTR_W-1:0]      dft_alloc_ptr,    // queue tail (enqueue)
+  output logic [QPTR_W-1:0]      dft_pop_ptr,      // queue head (in-order pop)
+  output logic [QUEUE_DEPTH*N_CH-1:0] dft_ch_done, // done bits, slot e at [e*N_CH +: N_CH]
+  output logic [N_CH*QPTR_W-1:0] dft_eng_rd_ptr,   // each engine's ring read pointer
+  output logic [N_CH*CNT_W-1:0]  dft_eng_m         // packets each engine issued for its entry
 );
 
-  // captured request (held through the split; req_in_* is the NEXT request after)
-  logic                 busy;
-  logic [CNT_W-1:0]     pkt_cnt;
-  logic [LINE_W-1:0]    req_line;      // 64B line of packet 0 (addr >> 6)
-  logic [PKT_OFF_W-1:0] req_offset;    // start byte in that line (addr[5:0])
-  logic [7:0]           req_len;
-  logic [2:0]           req_size;
-  logic [SLOT_W-1:0]    req_slot_base;
-  logic [ROB_IDX_W-1:0] req_rob_idx;
+  // Complete as a splitter. Remaining integration / open items live in rmc_cif.sv
+  // (RD-SRAM allocator for req_dbuf_base, per-channel req FIFOs + N_CH->1 arbiter for
+  // pkt_*, dbuf-addressing choice, scattered-map fallback).
 
-  wire capture = req_in_valid & ROB_READY;
+  // ---- pre-ROB queue (ring) ----
+  // Holds admitted-but-not-yet-split requests. One slot per request; the N_CH engines
+  // read these fields (via the wrapper mux) while they issue that request's packets, and
+  // ch_done[slot][c] records that channel c has finished its share of the slot.
+  logic [LINE_W-1:0]    q_aligned_base [QUEUE_DEPTH];   // 64B base line (addr >> 6)
+  logic [PKT_OFF_W-1:0] q_offset       [QUEUE_DEPTH];   // unaligned start offset (addr[5:0])
+  logic [CNT_W-1:0]     q_npkts        [QUEUE_DEPTH];   // packets this request splits into
+  logic [LEN_W-1:0]     q_len          [QUEUE_DEPTH];   // ar_len  -> resp trim
+  logic [SIZE_W-1:0]    q_size         [QUEUE_DEPTH];   // ar_size -> resp trim
+  logic [SLOT_W-1:0]    q_dbuf_base    [QUEUE_DEPTH];   // RD-SRAM head slot (= seg_head_ptr)
+  logic [ROB_IDX_W-1:0] q_rob_idx      [QUEUE_DEPTH];   // pre-allocated ROB index
+  logic [N_CH-1:0]      ch_done        [QUEUE_DEPTH];   // per-channel "done this slot" bits
 
-  // packet count (INCR): burst ends at align_down(addr,size)+(len+1)*2^size; one
-  // packet per 64B line touched.
-  localparam int SPAN_W = 16;
-  logic [PKT_OFF_W-1:0] off_aligned;
-  logic [SPAN_W-1:0]    span;
-  logic [SPAN_W-1:0]    n_pkts;
-  assign off_aligned = req_offset & ~PKT_OFF_W'((SPAN_W'(1) << req_size) - 1'b1);
+  // ring pointers: alloc at the tail (enqueue), pop at the head (in-order free). Both
+  // carry an extra top bit over the index so full and empty are distinguishable even
+  // when the low index bits are equal.
+  logic [QPTR_W-1:0] alloc_ptr;    // enqueue (extended, wrap bit)
+  logic [QPTR_W-1:0] pop_ptr;      // oldest entry (in-order free)
+
+  wire [QIDX_W-1:0] alloc_idx = alloc_ptr[QIDX_W-1:0];  // tail slot index (array addr)
+  wire [QIDX_W-1:0] pop_idx   = pop_ptr  [QIDX_W-1:0];  // head slot index (array addr)
+  wire queue_full  = (alloc_ptr - pop_ptr) == QPTR_W'(QUEUE_DEPTH); // all slots occupied
+  wire queue_empty = (alloc_ptr == pop_ptr);            // no live entries
+
+  assign ready = ~queue_full;      // accept a request whenever the ring has a free slot
+  wire enqueue = start_req & ready; // a request is actually written this cycle
+
+  // n_pkts at enqueue: span from 64B line start = align_down(offset, size) +
+  // (len+1)<<size; ceil(/64). AXI aligns every beat after the first to the beat size,
+  // so the burst ends at align_down(addr, size) + (len+1)*2^size - the raw offset
+  // would count one line too many for an unaligned start.
+  logic [PKT_OFF_W-1:0] off_aligned;   // start offset aligned down to the beat size
+  logic [SPAN_W-1:0]    span;          // bytes touched, from the 64B line start
+  logic [CNT_W-1:0]     npkts_calc;    // ceil(span/64) = packets for this request
+  assign off_aligned = req_addr[PKT_OFF_W-1:0] & ~PKT_OFF_W'((SPAN_W'(1) << req_size) - 1'b1);
   assign span        = SPAN_W'(off_aligned) + ((SPAN_W'(req_len) + 1'b1) << req_size);
-  assign n_pkts      = (span + SPAN_W'(PKT_BYTES - 1)) >> PKT_OFF_W;
-  // NPKTS is derived from the captured request regs, so only meaningful while busy;
-  // it truncates to CNT_W bits if a request needs more than MAX_PKTS packets.
-  assign SEG_NPKTS   = CNT_W'(n_pkts);
+  assign npkts_calc = CNT_W'((span + SPAN_W'((1 << PKT_OFF_W) - 1)) >> PKT_OFF_W);
 
-  // window: the next N_CH packets, each mapped to {channel, DRAM coords}
-  localparam int NUM_W = CNT_W + $clog2(N_CH) + 1;
-  logic [N_CH-1:0][NUM_W-1:0]   win_num;
-  logic [N_CH-1:0][CH_W-1:0]    win_ch;
-  logic [N_CH-1:0][DADDR_W-1:0] win_daddr;
+  // engines (one per channel)
+  // Each engine owns a channel and its own rd_ptr into the ring; it walks entries at its
+  // own pace. The wrapper feeds it the entry at its rd_ptr (q_* muxed by rdi below) and
+  // collects its set_done pulse.
+  logic [QPTR_W-1:0] eng_rd_ptr   [N_CH];   // each engine's read pointer into the ring
+  logic              eng_set_done [N_CH];   // engine c finished its share of its entry
+  logic [CNT_W-1:0]  eng_m        [N_CH];   // engine c packets issued (DFT tap)
 
+  // set mask: fan each engine's set_done onto the ch_done bit of the entry it is on, so
+  // the flop block can OR them in (engines may be on different entries this cycle).
+  logic [N_CH-1:0]   set_bits [QUEUE_DEPTH];
+  always_comb begin
+    for (int e = 0; e < QUEUE_DEPTH; e++) set_bits[e] = '0;
+    for (int c = 0; c < N_CH; c++)
+      if (eng_set_done[c]) set_bits[eng_rd_ptr[c][QIDX_W-1:0]][c] = 1'b1;
+  end
+
+  // instance the N_CH engines; entry_valid = this engine has not caught up to the tail.
+  genvar c;
   generate
-    for (genvar j = 0; j < N_CH; j++) begin : g_win
-      logic [LINE_W-1:0] line;
-      assign win_num[j] = NUM_W'(pkt_cnt) + NUM_W'(j);
-      assign line       = req_line + LINE_W'(win_num[j]);
-      rmc_cif_addrmap #(.AXI_AW (AXI_AW)) u_map (
-        .sys_addr ({line, {PKT_OFF_W{1'b0}}}),
-        .addr_map (addr_map),
-        .daddr    (win_daddr[j]),
-        .ch       (win_ch[j]),
-        .offset   ()
+    for (c = 0; c < N_CH; c++) begin : g_ch
+      wire [QIDX_W-1:0] rdi = eng_rd_ptr[c][QIDX_W-1:0];  // slot engine c is reading
+      rmc_cif_rseg_ch #(
+        .ROB_DEPTH   (ROB_DEPTH),
+        .MAX_PKTS    (MAX_PKTS),
+        .AXI_AW      (AXI_AW),
+        .N_SLOTS     (N_SLOTS),
+        .QUEUE_DEPTH (QUEUE_DEPTH)
+      ) u_ch (
+        .aclk           (aclk),
+        .aresetn        (aresetn),
+        .ch_id          (CH_W'(c)),
+        .addr_map       (addr_map),
+        .rd_ptr         (eng_rd_ptr[c]),
+        .entry_valid    (eng_rd_ptr[c] != alloc_ptr),
+        .e_aligned_base (q_aligned_base[rdi]),
+        .e_n_pkts       (q_npkts[rdi]),
+        .e_dbuf_base    (q_dbuf_base[rdi]),
+        .e_rob_idx      (q_rob_idx[rdi]),
+        .e_ch_done      (ch_done[rdi][c]),
+        .set_done       (eng_set_done[c]),
+        .pkt_valid      (pkt_valid[c]),
+        .pkt_ready      (pkt_ready[c]),
+        .pkt_dbuf_adr_ready (pkt_dbuf_adr_ready[c]),
+        .pkt_rob_idx    (pkt_rob_idx[c]),
+        .pkt_daddr      (pkt_daddr[c]),
+        .pkt_dbuf_adr   (pkt_dbuf_adr[c]),
+        .dft_m          (eng_m[c])
       );
     end
   endgenerate
 
-  // narrow: partial first/last line or a sub-bus beat (write accumulator masks it)
-  wire size_narrow = (32'(1) << req_size) < (AXI_DW / 8);
-  wire tail_part   = (span[PKT_OFF_W-1:0] != '0);
+  // head pop + seg_last (in order)
+  // When every channel has finished the oldest entry, retire it: pulse seg_last to the
+  // ROB with that request's rob_idx + the resp meta, and free the slot. In-order pop
+  // keeps seg_last in program order even though engines finish entries out of order.
+  wire head_all_done = ~queue_empty & (&ch_done[pop_idx]); // oldest entry fully segmented
+  assign seg_last     = head_all_done;
+  assign seg_rob_idx  = q_rob_idx[pop_idx];
+  assign seg_npkts    = q_npkts[pop_idx];
+  assign seg_offset   = q_offset[pop_idx];
+  assign seg_len      = q_len[pop_idx];
+  assign seg_size     = q_size[pop_idx];
+  assign seg_head_ptr = q_dbuf_base[pop_idx];
 
-  // issue: walk the window in order, stop at the first packet that cannot go
-  logic [N_CH-1:0]  ch_used;
-  logic             take;
-  logic [NUM_W-1:0] n_take;
-  logic             w_last;
-  always_comb begin
-    packet_valid       = '0;
-    packet_daddr       = '0;
-    packet_pkt_num     = '0;
-    packet_last_in_txn = '0;
-    packet_slot        = '0;
-    packet_offset      = '0;
-    packet_narrow      = '0;
-    ch_used            = '0;
-    n_take             = '0;
-    take               = busy;
-    w_last             = 1'b0;
-    for (int j = 0; j < N_CH; j++) begin
-      take = take & (SPAN_W'(win_num[j]) < n_pkts)
-                  & ~ch_used[win_ch[j]] & packet_ready[win_ch[j]];
-      if (take) begin
-        w_last                        = (SPAN_W'(win_num[j]) + 1'b1 == n_pkts);
-        ch_used[win_ch[j]]            = 1'b1;
-        packet_valid[win_ch[j]]       = 1'b1;
-        packet_daddr[win_ch[j]]       = win_daddr[j];
-        packet_pkt_num[win_ch[j]]     = PKT_NUM_W'(win_num[j]);
-        packet_last_in_txn[win_ch[j]] = w_last;
-        packet_slot[win_ch[j]]        = req_slot_base + SLOT_W'(win_num[j]);
-        packet_offset[win_ch[j]]      = (win_num[j] == '0) ? req_offset : '0;
-        packet_narrow[win_ch[j]]      = size_narrow
-                                      | ((win_num[j] == '0) & (req_offset != '0))
-                                      | (w_last & tail_part);
-        n_take = NUM_W'(j + 1);
-      end
-    end
-  end
-
-  assign packet_rob_index = {N_CH{req_rob_idx}};
-
-  // last packet leaves this cycle: close the request at r_rob
-  assign SEG_LAST = busy & (n_take != '0)
-                  & (SPAN_W'(pkt_cnt) + SPAN_W'(n_take) == n_pkts);
-
+  // queue flops
+  // Three parallel updates: enqueue writes a new tail slot and bumps alloc_ptr; ch_done
+  // clears for a freshly enqueued slot and otherwise accumulates the engines' set_bits;
+  // head_all_done bumps pop_ptr to free the oldest slot.
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      busy          <= 1'b0;
-      pkt_cnt       <= '0;
-      req_line      <= '0;
-      req_offset    <= '0;
-      req_len       <= '0;
-      req_size      <= '0;
-      req_slot_base <= '0;
-      req_rob_idx   <= '0;
+      alloc_ptr <= '0;
+      pop_ptr   <= '0;
+      for (int e = 0; e < QUEUE_DEPTH; e++) ch_done[e] <= '0;
     end else begin
-      if (busy) begin
-        pkt_cnt <= pkt_cnt + CNT_W'(n_take);
-        if (SEG_LAST) busy <= 1'b0;
+      // enqueue: latch the request into the tail slot (addr split into line + offset,
+      // n_pkts precomputed, len/size/dbuf/rob_idx carried for the split + resp).
+      if (enqueue) begin
+        q_aligned_base[alloc_idx] <= req_addr[AXI_AW-1:PKT_OFF_W];
+        q_offset      [alloc_idx] <= req_addr[PKT_OFF_W-1:0];
+        q_npkts       [alloc_idx] <= npkts_calc;
+        q_len         [alloc_idx] <= req_len;
+        q_size        [alloc_idx] <= req_size;
+        q_dbuf_base   [alloc_idx] <= req_dbuf_base;
+        q_rob_idx     [alloc_idx] <= req_rob_idx;
+        alloc_ptr                 <= alloc_ptr + 1'b1;
       end
-      if (capture) begin            // ROB_READY low while busy, so never mid-split
-        busy          <= 1'b1;
-        pkt_cnt       <= '0;
-        req_line      <= req_in_addr[AXI_AW-1:PKT_OFF_W];
-        req_offset    <= req_in_addr[PKT_OFF_W-1:0];
-        req_len       <= req_in_len;
-        req_size      <= req_in_size;
-        req_slot_base <= req_in_slot_base;
-        req_rob_idx   <= ROB_IDX;
+      // ch_done: fresh slot clears; otherwise OR in the engines' sets
+      for (int e = 0; e < QUEUE_DEPTH; e++) begin
+        if (enqueue & (alloc_idx == QIDX_W'(e)))
+          ch_done[e] <= '0;
+        else
+          ch_done[e] <= ch_done[e] | set_bits[e];
       end
+      if (head_all_done)
+        pop_ptr <= pop_ptr + 1'b1;
     end
   end
 
   // DFT taps (wiring only)
-  assign dft_busy    = busy;
-  assign dft_pkt_cnt = pkt_cnt;
-
-  // read meta from the captured copy (req_in_* has moved on by SEG_LAST)
-  assign SEG_OFFSET   = req_offset;
-  assign SEG_LEN      = req_len;
-  assign SEG_SIZE     = req_size;
-  assign SEG_HEAD_PTR = req_slot_base;
+  assign dft_alloc_ptr = alloc_ptr;
+  assign dft_pop_ptr   = pop_ptr;
+  for (genvar e = 0; e < QUEUE_DEPTH; e++) begin : g_dft_slot
+    assign dft_ch_done[e*N_CH +: N_CH] = ch_done[e];
+  end
+  for (genvar k = 0; k < N_CH; k++) begin : g_dft_eng
+    assign dft_eng_rd_ptr[k*QPTR_W +: QPTR_W] = eng_rd_ptr[k];
+    assign dft_eng_m[k*CNT_W +: CNT_W]        = eng_m[k];
+  end
 
 endmodule : rmc_cif_rseg
