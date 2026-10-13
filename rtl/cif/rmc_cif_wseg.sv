@@ -10,7 +10,7 @@
 // (unaligned/narrow) rides as WSTRB with the data, so only packet_narrow is flagged.
 //
 // The split MATH (n_pkts = ceil(span/64), per-cycle N_CH window, channel walk,
-// pkt_num, per-packet daddr via rmc_cif_addrmap) is identical to rmc_cif_rseg.
+// pkt_num, per-packet daddr via rmc_cif_addrmap) is identical to rmc_cif_r_burst_spltr.
 //
 // STUB: ports + the write slot/chain engine are TODO. Split math to mirror rseg.
 
@@ -70,7 +70,7 @@ module rmc_cif_wseg #(
   output logic [N_CH-1:0]                packet_narrow
 );
 
-  // LEFT TO DO: mirror the pipelined read segmenter (rmc_cif_rseg + rmc_cif_rseg_ch):
+  // LEFT TO DO: mirror the pipelined read segmenter (rmc_cif_r_burst_spltr + rmc_cif_r_burst_spltr_ch):
   //   - same pre-ROB ring queue + N_CH per-channel stride engines, multi-outstanding,
   //     in-order head pop -> SEG_LAST + SEG_ROB_IDX to w_rob (wrob needs the same
   //     multi-outstanding rework rrob just got).

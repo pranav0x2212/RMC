@@ -61,7 +61,7 @@ bus out (also an output port of `rmc_cif`). Fields are packed LSB-first in the o
 of the `O_<field>` localparams; total width is `rmc_cif_dft_pkg::dft_obs_w()`
 (3196 bits at defaults). Taps cover AXI ingress, address map, validator, read/write
 ROB (`rmc_cif_rrob`/`rmc_cif_wrob`), the read segmenter queue and per-channel walkers
-(`rmc_cif_rseg`/`rmc_cif_rseg_ch`), the write segmenter stub (`rmc_cif_wseg`),
+(`rmc_cif_r_burst_spltr`/`rmc_cif_r_burst_spltr_ch`), the write segmenter stub (`rmc_cif_wseg`),
 the MC request/completion boundary, WD/RD SRAM client ports, clock and reset.
 `order_q`, `inflow_cnt` and `ent_valid` do not exist in the RTL and are not tapped.
 

@@ -1,6 +1,6 @@
-// rmc_cif_rseg.sv
+// rmc_cif_r_burst_spltr.sv
 // READ burst segmenter - full, pipelined. A pre-ROB queue (ring, QUEUE_DEPTH) holds
-// admitted requests; N_CH per-channel engines (rmc_cif_rseg_ch) each walk the ring at
+// admitted requests; N_CH per-channel engines (rmc_cif_r_burst_spltr_ch) each walk the ring at
 // their own pace and issue their channel's 64B packets. An entry pops (in order) when
 // every channel has marked it done, pulsing seg_last to the ROB.
 //
@@ -16,7 +16,7 @@
 
 import rmc_cfg_pkg::*;
 
-module rmc_cif_rseg #(
+module rmc_cif_r_burst_spltr #(
   parameter int ROB_DEPTH   = 32,         // ROB entries (rob_idx width)   [root knob]
   parameter int MAX_PKTS    = 64,         // max packets per request       [root knob]
   parameter int AXI_AW      = SYS_ADDR_W, // AXI address width             [root knob]
@@ -144,7 +144,7 @@ module rmc_cif_rseg #(
   generate
     for (c = 0; c < N_CH; c++) begin : g_ch
       wire [QIDX_W-1:0] rdi = eng_rd_ptr[c][QIDX_W-1:0];  // slot engine c is reading
-      rmc_cif_rseg_ch #(
+      rmc_cif_r_burst_spltr_ch #(
         .ROB_DEPTH   (ROB_DEPTH),
         .MAX_PKTS    (MAX_PKTS),
         .AXI_AW      (AXI_AW),
@@ -232,4 +232,4 @@ module rmc_cif_rseg #(
     assign dft_eng_m[k*CNT_W +: CNT_W]        = eng_m[k];
   end
 
-endmodule : rmc_cif_rseg
+endmodule : rmc_cif_r_burst_spltr

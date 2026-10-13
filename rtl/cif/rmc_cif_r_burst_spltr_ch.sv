@@ -1,6 +1,6 @@
-// rmc_cif_rseg_ch.sv
+// rmc_cif_r_burst_spltr_ch.sv
 // READ burst segmenter - one channel, ring walker. Instanced once per DRAM channel by
-// rmc_cif_rseg. Walks the shared pre-ROB queue at its own pace (own rd_ptr), issuing
+// rmc_cif_r_burst_spltr. Walks the shared pre-ROB queue at its own pace (own rd_ptr), issuing
 // only the 64B packets that land in its channel (ch_id), and marks the entry done for
 // this channel when its share is drained.
 //
@@ -17,7 +17,7 @@
 
 import rmc_cfg_pkg::*;
 
-module rmc_cif_rseg_ch #(
+module rmc_cif_r_burst_spltr_ch #(
   parameter int ROB_DEPTH   = 32,         // ROB entries (rob_idx width)   [root knob]
   parameter int MAX_PKTS    = 64,         // max packets per request       [root knob]
   parameter int AXI_AW      = SYS_ADDR_W, // AXI address width             [root knob]
@@ -87,14 +87,14 @@ module rmc_cif_rseg_ch #(
     .offset   (map_off)
   );
 
-  wire have_work = entry_valid & ~e_ch_done;   // this engine still owes the current entry
+  wire owes_entry = entry_valid & ~e_ch_done;   // this engine still owes the current entry
 
   assign pkt_rob_idx  = e_rob_idx;
   assign pkt_dbuf_adr = e_dbuf_base + SLOT_W'(k);
   // dbuf-full is a per-channel issue stall (not a head/admit stall): if the RD-SRAM
   // has no slot for this packet, hold here - other channels and earlier packets drain.
-  assign pkt_valid    = have_work & (k <  e_n_pkts) & pkt_dbuf_adr_ready;
-  assign set_done     = have_work & (k >= e_n_pkts);     // my share drained (incl zero-pkt)
+  assign pkt_valid    = owes_entry & (k <  e_n_pkts) & pkt_dbuf_adr_ready;
+  assign set_done     = owes_entry & (k >= e_n_pkts);     // my share drained (incl zero-pkt)
 
   wire skip = entry_valid & e_ch_done;                   // already done here -> just advance
 
@@ -112,4 +112,4 @@ module rmc_cif_rseg_ch #(
 
   assign dft_m = m;
 
-endmodule : rmc_cif_rseg_ch
+endmodule : rmc_cif_r_burst_spltr_ch

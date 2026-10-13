@@ -231,7 +231,7 @@ module rmc_cif #(
   // read segmenter. TODO: req_dbuf_base from the RD-SRAM slot allocator (not built) and
   // pkt_* -> the per-channel req async FIFOs (single async_mc_req_* port today; needs an
   // N_CH->1 arbiter or a per-channel FIFO interface).
-  rmc_cif_rseg #(
+  rmc_cif_r_burst_spltr #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW), .N_SLOTS (N_RDB)
   ) u_rseg (
     .aclk         (aclk),

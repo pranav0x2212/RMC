@@ -5,8 +5,8 @@ rtl/cif/rmc_cif_dft_pkg.sv
 rtl/cif/rmc_cif_dft.sv
 rtl/cif/rmc_cif_addrmap.sv
 rtl/cif/rmc_cif_reqvalidator.sv
-rtl/cif/rmc_cif_rseg_ch.sv
-rtl/cif/rmc_cif_rseg.sv
+rtl/cif/rmc_cif_r_burst_spltr_ch.sv
+rtl/cif/rmc_cif_r_burst_spltr.sv
 rtl/cif/rmc_cif_wseg.sv
 rtl/cif/rmc_cif_rrob.sv
 rtl/cif/rmc_cif_wrob.sv
