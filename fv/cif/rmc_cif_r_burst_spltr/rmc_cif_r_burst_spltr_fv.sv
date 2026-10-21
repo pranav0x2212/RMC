@@ -255,6 +255,14 @@ module rmc_cif_r_burst_spltr_fv #(
     for (int b = 0; b < DEC_W; b++) exp_dec[b] = a[addr_map[b]];
   endfunction
 
+  // channel field of exp_dec. Selected from a local variable: a part-select on a function
+  // call result is not accepted by every parser.
+  function automatic logic [CH_W-1:0] exp_ch(input logic [AXI_AW-1:0] a);
+    logic [DEC_W-1:0] d;
+    d = exp_dec(a);
+    return d[PKT_OFF_W +: CH_W];
+  endfunction
+
   logic [QIDX_W-1:0] fv_e;
   always_ff @(posedge aclk) fv_e <= fv_e;
 
@@ -284,7 +292,7 @@ module rmc_cif_r_burst_spltr_fv #(
   endfunction
   logic [PG_LINES-1:0][CH_W-1:0] w_chan;
   always_comb for (int i = 0; i < PG_LINES; i++)
-    w_chan[i] = exp_dec(w_line_byte(LN_W'(i)))[PKT_OFF_W +: CH_W];
+    w_chan[i] = exp_ch(w_line_byte(LN_W'(i)));
 
   logic [N_CH-1:0] at_e;
   always_comb for (int c = 0; c < N_CH; c++)
@@ -406,7 +414,7 @@ module rmc_cif_r_burst_spltr_fv #(
   // Checked at admit, for every line of the page, against the full-address decode.
   // ------------------------------------------------------------------------
   // base_ch is the channel of the request's first line
-  `ASSERT(a_base_ch, !admit || admit_base_ch == exp_dec(ref_line_byte(ref_l0_b))[PKT_OFF_W +: CH_W]);
+  `ASSERT(a_base_ch, !admit || admit_base_ch == exp_ch(ref_line_byte(ref_l0_b)));
   for (genvar i = 0; i < PG_LINES; i++) begin : g_rebuild
     wire [PAGE_LSB-1:0] lo  = {LN_W'(i), {PKT_OFF_W{1'b0}}};      // what the R path knows
     wire [DEC_W-1:0]    dec = exp_dec(ref_line_byte(LN_W'(i)));   // the truth
