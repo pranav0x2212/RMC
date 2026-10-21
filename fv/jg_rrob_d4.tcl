@@ -12,8 +12,15 @@
 # same as the d4 prove/cover tasks: the neighbour assumptions m_admit_npkts, m_seg_last
 # and m_cmpl stay assumes.
 
-# fv/ directory = where this script lives
-if {[catch {set fv_dir [file dirname [file normalize [info script]]]}] || $fv_dir eq ""} {
+# fv/ directory = where this script lives. jg may not set [info script] (empty), then fall
+# back to the working directory: the repo root (has fv/) or fv/ itself.
+set script_path ""
+catch {set script_path [info script]}
+if {$script_path ne ""} {
+  set fv_dir [file dirname [file normalize $script_path]]
+} elseif {[file isdirectory [pwd]/fv]} {
+  set fv_dir [file normalize [pwd]/fv]
+} else {
   set fv_dir [pwd]
 }
 set rtl_dir [file normalize $fv_dir/../rtl]
