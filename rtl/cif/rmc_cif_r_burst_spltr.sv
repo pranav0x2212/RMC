@@ -269,11 +269,9 @@ module rmc_cif_r_burst_spltr #(
   logic [N_CH-1:0]             eng_set_done, eng_head_we, eng_idle;
   logic [N_CH-1:0][SLOT_W-1:0] eng_head;
 
-  always_comb
-    for (int c = 0; c < N_CH; c++) eng_ri[c] = eng_rd[c][QIDX_W-1:0];
-
   generate
     for (genvar c = 0; c < N_CH; c++) begin : g_eng
+      assign eng_ri[c] = eng_rd[c][QIDX_W-1:0];   // slot index = low bits of the engine's pointer
       rmc_cif_r_burst_spltr_ch #(
         .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW),
         .N_SLOTS (N_SLOTS), .QUEUE_DEPTH (QUEUE_DEPTH)

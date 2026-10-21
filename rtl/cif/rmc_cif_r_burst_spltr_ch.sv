@@ -140,7 +140,7 @@ module rmc_cif_r_burst_spltr_ch #(
   logic [CH_W-1:0]      daddr_ch_unused;
   logic [PKT_OFF_W-1:0] daddr_off_unused;
   rmc_cif_addrmap #(.AXI_AW(AXI_AW), .DADDR_W(DADDR_W)) u_map (
-    .sys_addr (line_byte(sel_i)),
+    .sys_addr ({e_base[LINE_W-1:LN_W], sel_i, {LINE_LSB{1'b0}}}),
     .addr_map (addr_map),
     .daddr    (pkt_daddr),
     .ch       (daddr_ch_unused),
