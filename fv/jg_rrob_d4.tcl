@@ -20,8 +20,11 @@ set rtl_dir [file normalize $fv_dir/../rtl]
 
 clear -all
 
-# compile order as in the .sby: package, RTL, checker, bind
-analyze -sv12 -define FORMAL \
+# compile order as in the .sby: package, RTL, checker, bind.
+# The .sby passes -D FORMAL, but no source tests FORMAL (only FV_JOIN / FV_LIVE, both
+# undefined for d4), so it is omitted: JASPER1909 analyze has no -define switch
+# (ESW087). If a macro is ever needed, check `help analyze` for the define syntax.
+analyze -sv12 \
   $rtl_dir/rtl_pkg_config/rmc_cfg_pkg.sv \
   $rtl_dir/cif/rmc_cif_rrob.sv \
   $fv_dir/cif/rmc_cif_rrob/rmc_cif_rrob_fv.sv \
